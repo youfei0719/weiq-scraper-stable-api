@@ -1,72 +1,206 @@
-# WEIQ 数据采集与分析（稳定版）
+# WEIQ 数据采集与分析（零基础可用版）
 
-本项目当前提供两条可用主链路：
-- 采集链路：`Excel 账号输入 -> Playwright 采集 -> Excel 结果输出`
-- 分析链路：`Streamlit 看板读取结果 Excel 并可视化分析`
+这份文档是给**没有编程基础**的同学写的。
+你可以把它当作“照着做就能跑起来”的操作手册。
 
-同时提供轻量 API 任务壳（FastAPI + SQLite + 单 worker）用于网站或后端轮询接入。
+## 你可以用它做什么
 
-## 当前能力
+这个项目可以帮助你把一批账号的数据自动采集下来，并自动生成可视化分析面板。
 
-### 1) 可恢复采集（`scraper.py`）
-- CLI 参数化：输入表、输出目录、状态文件、限速、重试、无头模式等。
-- 断点续跑：按 `run_id + uid` 记录处理状态，可恢复中断任务。
-- 标准元数据字段（写入结果表）：
-  - `run_id`
-  - `crawl_time`
-  - `account_status`
-  - `error_code`
-  - `error_message`
-- 原子写入：结果写盘采用“临时文件 + 原子替换”策略，降低中断损坏风险。
-- 反爬恢复：登录失效、验证码、超时、空页面等场景统一错误码。
+完整流程是：
+- 准备账号表（Excel）
+- 运行采集程序（自动打开浏览器）
+- 得到采集结果（Excel）
+- 打开分析看板（图表）
 
-### 2) 轻量任务 API（`cloud_api.py`）
-- 任务状态持久化：SQLite（`weiq_local.db`）。
-- 单 worker 串行执行：适合单人、周频、100-500 账号规模。
-- 支持接口：
-  - `POST /v1/tasks/crawl` 创建任务
-  - `GET /v1/tasks/{task_id}` 查询任务状态
-  - `POST /v1/tasks/{task_id}/cancel` 取消任务
-  - `POST /v1/tasks/{task_id}/resume` 登录阻塞后继续
-  - `GET /v1/tasks/{task_id}/latest` 查询该任务最新结果
-  - `GET /v1/tasks/{task_id}/quality` 查询该任务质量评分
-  - `GET /v1/accounts/{uid}/changes` 查询账号指标变化摘要
+你不需要先学会编程，按本文步骤执行即可。
 
-### 3) 分析看板（`main.py`）
-- 读取 `weiq_results.xlsx`（或环境变量 `WEIQ_DATA_FILE` 指定文件）。
-- 若结果表包含 `run_id`，支持按批次筛选分析。
+## 先看这 3 件事
+
+1. 你至少需要有一个 `uid` 列的账号表（Excel）。
+2. 第一次运行时会要求你在浏览器里登录 WEIQ，这是正常流程。
+3. 如果中途断了，可以用“断点续跑”继续，不会从头全部重跑。
+
+## 项目功能（通俗版）
+
+### 1) 采集引擎（`scraper.py`）
+- 自动打开网页并抓取账号指标。
+- 支持失败重试、冷却防风控、登录失效后恢复。
+- 每条数据会自动带上运行批次和错误信息，便于回溯。
+
+### 2) 分析看板（`main.py`）
+- 打开浏览器就能看图表，不需要你写 SQL。
+- 支持按 `run_id`（运行批次）筛选。
+
+### 3) API 服务（`cloud_api.py`，可选）
+- 给网站或后端接入用。
+- 可以创建任务、看进度、取消、继续、拉取结果。
+- 如果你只是自己手工跑一次，不用先学 API。
 
 ## 目录结构
 
 ```text
 .
-├── scraper.py       # 采集内核 + CLI
-├── cloud_api.py     # 轻量 API 任务壳
-├── main.py          # Streamlit 分析看板
+├── scraper.py       # 采集程序（最常用）
+├── main.py          # 数据分析看板
+├── cloud_api.py     # API 服务（可选）
+├── analytics.py     # 变化摘要与质量评分
 ├── tests/           # 基础测试
 ├── pyproject.toml
 └── README.md
 ```
 
-## 安装
+## 一、Windows 教程（给零基础）
 
-```bash
+> 建议使用 Windows Terminal / PowerShell。
+
+### 第 1 步：安装 Python（只做一次）
+
+1. 打开 Python 官网下载 Python 3.12+。
+2. 安装时**勾选** `Add python.exe to PATH`。
+3. 安装完成后打开 PowerShell，执行：
+
+```powershell
+python --version
+```
+
+看到版本号（例如 `Python 3.12.x`）说明成功。
+
+### 第 2 步：进入项目目录
+
+假设你把项目放在桌面 `weiq-scraper-stable-api` 文件夹：
+
+```powershell
+cd $HOME\Desktop\weiq-scraper-stable-api
+```
+
+### 第 3 步：安装项目依赖（只做一次）
+
+```powershell
 python -m pip install --upgrade pip
 python -m pip install -e .
 python -m playwright install chromium --no-shell
 ```
 
-## 采集 CLI 用法
+### 第 4 步：准备账号 Excel
 
-### 最简运行
+在项目目录放一个 `accounts.xlsx` 文件，至少包含两列：
 
-```bash
+- `账号ID`：你给账号起的名字（例如 客户A）
+- `uid`：账号唯一 ID（必填）
+
+示例：
+
+| 账号ID | uid |
+| --- | --- |
+| 客户A | 123456 |
+| 客户B | 789012 |
+
+### 第 5 步：开始采集
+
+```powershell
 python scraper.py
 ```
 
-默认读取：`accounts.xlsx`，默认输出：当前目录 `weiq_results.xlsx`。
+说明：
+- 第一次会打开浏览器，提示你登录 WEIQ。
+- 登录完成后，回到终端按回车继续。
+- 采集完成后会生成 `weiq_results.xlsx`。
 
-### 常用参数
+### 第 6 步：打开分析看板
+
+```powershell
+python -m streamlit run main.py
+```
+
+终端会显示一个本地地址（通常是 `http://localhost:8501`），浏览器打开即可看图表。
+
+### 常用命令（Windows）
+
+自定义输入和输出目录：
+
+```powershell
+python scraper.py --input-excel .\accounts.xlsx --output-dir .\exports
+```
+
+禁用断点续跑：
+
+```powershell
+python scraper.py --no-resume
+```
+
+## 二、Mac 教程（给零基础）
+
+> 建议使用 macOS 自带 Terminal。
+
+### 第 1 步：安装 Python（只做一次）
+
+1. 安装 Python 3.12+（官网安装包或 Homebrew 均可）。
+2. 终端执行：
+
+```bash
+python3 --version
+```
+
+如果你机器是 `python` 命令，也可用 `python --version`。
+
+### 第 2 步：进入项目目录
+
+假设项目在桌面：
+
+```bash
+cd ~/Desktop/weiq-scraper-stable-api
+```
+
+### 第 3 步：安装项目依赖（只做一次）
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install -e .
+python3 -m playwright install chromium --no-shell
+```
+
+### 第 4 步：准备账号 Excel
+
+在项目目录放置 `accounts.xlsx`，至少包含：
+
+- `账号ID`
+- `uid`
+
+### 第 5 步：开始采集
+
+```bash
+python3 scraper.py
+```
+
+流程与 Windows 一样：
+- 第一次会弹浏览器登录
+- 登录后回终端按回车
+- 完成后输出 `weiq_results.xlsx`
+
+### 第 6 步：打开分析看板
+
+```bash
+python3 -m streamlit run main.py
+```
+
+打开终端给出的本地地址（通常 `http://localhost:8501`）。
+
+### 常用命令（Mac）
+
+自定义输入和输出目录：
+
+```bash
+python3 scraper.py --input-excel ./accounts.xlsx --output-dir ./exports
+```
+
+指定历史批次继续：
+
+```bash
+python3 scraper.py --run-id run_20260531_120000_ab12cd
+```
+
+## 三、最常用参数（看不懂可以先跳过）
 
 ```bash
 python scraper.py \
@@ -74,19 +208,25 @@ python scraper.py \
   --output-dir ./exports \
   --output-excel weiq_results.xlsx \
   --state-json ./state.json \
-  --state-storage ./state_store.json \
+  --state-storage ./crawl_state.json \
   --cooldown-every 50 \
   --cooldown-seconds 180 \
   --retry-times 2 \
   --retry-backoff-seconds 3
 ```
 
-可选参数：
-- `--headless`：无头模式
-- `--run-id <id>`：指定 run_id 恢复或重跑
-- `--no-resume`：禁用断点续跑
+参数解释：
+- `--input-excel`：输入账号表
+- `--output-dir`：结果输出目录
+- `--state-json`：登录态缓存文件
+- `--state-storage`：断点续跑状态文件
+- `--retry-times`：失败重试次数
 
-## 启动 API
+## 四、API 使用（可选）
+
+如果你要把采集接入网站/系统，可以启用 API。
+
+### 启动 API
 
 ```bash
 python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080
@@ -98,85 +238,50 @@ python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080
 curl http://127.0.0.1:8080/health
 ```
 
-### 创建任务
+### API 功能
 
-```bash
-curl -X POST "http://127.0.0.1:8080/v1/tasks/crawl" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input_excel": "accounts.xlsx",
-    "output_excel": "weiq_results.xlsx",
-    "output_dir": ".",
-    "retry_times": 2,
-    "resume": true
-  }'
-```
+- `POST /v1/tasks/crawl` 创建任务
+- `GET /v1/tasks/{task_id}` 查询状态
+- `POST /v1/tasks/{task_id}/cancel` 取消任务
+- `POST /v1/tasks/{task_id}/resume` 登录后继续
+- `GET /v1/tasks/{task_id}/latest` 获取任务结果
+- `GET /v1/tasks/{task_id}/quality` 查看质量评分
+- `GET /v1/accounts/{uid}/changes` 查看指标变化摘要
 
-### 轮询任务状态
+## 五、常见问题（小白版）
 
-```bash
-curl "http://127.0.0.1:8080/v1/tasks/<task_id>"
-```
+### 1) 运行后没反应 / 卡住
 
-状态枚举：
-- `PENDING`
-- `RUNNING`
-- `BLOCKED_AUTH`
-- `SUCCESS`
-- `FAILED`
-- `CANCELLED`
+先看终端是不是在等你登录或验证码处理。
+很多时候不是程序死了，而是等人工处理风控。
 
-### 登录阻塞后继续
+### 2) 结果文件在哪里
 
-```bash
-curl -X POST "http://127.0.0.1:8080/v1/tasks/<task_id>/resume"
-```
+默认在当前目录：`weiq_results.xlsx`。
+如果你用了 `--output-dir`，去那个目录找。
 
-### 取消任务
+### 3) 中断后如何继续
 
-```bash
-curl -X POST "http://127.0.0.1:8080/v1/tasks/<task_id>/cancel"
-```
+再次运行同样命令即可，默认会根据 `crawl_state.json` 尝试续跑。
 
-### 查询任务最新结果
+### 4) 看板提示没有数据
 
-```bash
-curl "http://127.0.0.1:8080/v1/tasks/<task_id>/latest?limit=20"
-```
+检查：
+- 是否已经成功生成 `weiq_results.xlsx`
+- 是否在正确目录运行 `streamlit`
+- 是否设置了错误的 `WEIQ_DATA_FILE`
 
-### 查询任务质量评分
+## 六、运行结果里关键字段是什么意思
 
-```bash
-curl "http://127.0.0.1:8080/v1/tasks/<task_id>/quality"
-```
+每条账号记录里新增了下面几个字段：
 
-### 查询账号变化摘要
+- `run_id`：本次运行批次号
+- `crawl_time`：采集时间
+- `account_status`：该账号采集状态（SUCCESS / FAILED / SKIPPED）
+- `error_code`：失败类型代码
+- `error_message`：失败中文说明
 
-```bash
-curl "http://127.0.0.1:8080/v1/accounts/<uid>/changes?output_excel=weiq_results.xlsx&limit=30"
-```
-
-## 启动看板
-
-```bash
-python -m streamlit run main.py
-```
-
-如果采集输出不在默认路径，可先设置：
-
-```bash
-export WEIQ_DATA_FILE=/绝对路径/weiq_results.xlsx
-python -m streamlit run main.py
-```
-
-## 测试
-
-```bash
-python -m unittest discover -s tests -p 'test_*.py'
-```
-
-## 错误码（采集）
-
+常见错误码：
 - `NONE`
 - `INVALID_UID`
 - `HTTP_BLOCKED`
@@ -188,10 +293,16 @@ python -m unittest discover -s tests -p 'test_*.py'
 - `WRITE_ERROR`
 - `CANCELLED`
 
-## 安全建议
+## 七、安全提醒（很重要）
 
-请勿提交以下文件到仓库：
+以下文件不要上传到公开仓库：
 - `state.json`
+- `crawl_state.json`
 - `*.db`
 - `accounts.xlsx`
 - `weiq_results*.xlsx`
+
+## 八、给第一次使用者的建议
+
+你可以先用 3~5 个账号做一轮小测试，确认流程没问题后，再跑全量任务。
+这样最稳、最省时间。
