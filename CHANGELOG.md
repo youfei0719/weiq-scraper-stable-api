@@ -1,30 +1,85 @@
 # 更新日志
 
-## [v0.2.0] - 2026-05-31
+本项目遵循语义化版本（SemVer），并参考 Keep a Changelog 维护。
 
-### Added
-- `scraper.py` 重构为可复用采集内核，支持 CLI 参数化配置。
-- 新增结果元数据字段：`run_id`, `crawl_time`, `account_status`, `error_code`, `error_message`。
-- 新增断点续跑状态存储（按 `run_id + uid`）。
-- 新增 `cloud_api.py`（FastAPI + SQLite + 单 worker）任务壳。
-- 新增 API 接口：
-  - `POST /v1/tasks/crawl`
-  - `GET /v1/tasks/{task_id}`
-  - `POST /v1/tasks/{task_id}/cancel`
+## [v1.2.0] - 2026-04-12
+
+发布时间：**2026-04-12 20:58:41 CST (+0800, Asia/Shanghai)**
+
+### Added（新增）
+- 新增桌面端“多账号表运行”能力：支持从 `inputs/*.xlsx` 选择不同来源表执行任务。
+- 新增导出目录配置能力：任务启动前可指定 `output_dir`，并支持自动创建目录。
+- 新增导出后文件管理：支持将本次导出文件复制到任意目标目录，不影响原始文件。
+- 新增任务可观测字段（桌面端与 API 同步）：
+  - `status_zh`
+  - `error_message_zh`
+  - `output_dir`
+  - `export_file`
+  - `auth_waiting`
+  - `resume_requested`
+  - `auth_check_passed`
+- 新增登录等待阶段中文引导文案，降低非技术用户操作门槛。
+- 新增按键问题排查入口（关键字扫描），用于定位 `key/keyboard/快捷键` 相关异常。
+
+### Changed（变更）
+- 登录恢复机制从“自动恢复”改为“手动点击继续后校验恢复”：
+  - 登录失效后浏览器窗口保持打开。
+  - 用户完成登录后必须点击“继续”。
+  - 系统校验通过才恢复采集。
+- 登录等待阶段采集导航行为收敛为“静默等待”，避免登录页面闪烁或被任务抢占。
+- 导出命名策略升级：按来源表 + 时间戳命名，避免同日重复任务覆盖历史文件。
+- 任务状态中文化增强：前端可见文案尽可能中文，错误码保留英文用于定位。
+- 项目文档结构重写：README 增加面向非技术用户的分步教程及 API 网站接入教程。
+
+### Fixed（修复）
+- 修复“进度条长期 0% 且界面显示运行中”的假运行问题：
+  - 启动阶段异常时可回写失败状态，避免状态滞留 `RUNNING`。
+  - 旧库缺字段导致插入失败时，给出可读错误并支持兼容策略。
+- 修复登录阻塞时浏览器被过早关闭问题，保证用户可在窗口内完成重新登录。
+- 修复登录恢复阶段误触发采集跳转导致页面闪烁的问题。
+- 修复导航上下文类异常（如 `Execution context was destroyed`）直接误判登录失败的问题，改为优先可恢复重试。
+- 修复桌面端部分过时参数告警（`use_container_width` -> `width="stretch"`）。
+
+### API 兼容与影响
+- 任务状态查询接口新增字段（向后兼容）：
+  - `status_zh`
+  - `error_message_zh`
+  - `output_dir`
+  - `auth_waiting`
+  - `resume_requested`
+  - `auth_check_passed`
+- 保持错误码英文语义不变（如 `AUTH_REQUIRED`、`DB_SCHEMA_MISMATCH`），前端建议“中文解释 + 英文错误码”展示。
+- 控制接口语义保持不变：
+  - `POST /v1/tasks/{task_id}/pause`
   - `POST /v1/tasks/{task_id}/resume`
-  - `GET /v1/tasks/{task_id}/latest`
-- 新增扩展分析能力（阶段 3 轻量版）：
-  - `GET /v1/tasks/{task_id}/quality` 质量评分与预警
-  - `GET /v1/accounts/{uid}/changes` 增量变化摘要
-- 新增基础测试：状态存储与 API 最小生命周期。
+  - `POST /v1/tasks/{task_id}/cancel`
 
-### Changed
-- 结果写盘改为临时文件原子替换，降低中断导致文件损坏风险。
-- 反爬相关场景统一标准错误码输出。
-- `main.py` 支持按 `run_id` 批次筛选分析。
-- `README.md` 改为与当前实际代码一致。
-- `pyproject.toml` 补齐看板和 API 依赖。
+### Security（安全）
+- 加强 `.gitignore` 敏感文件规则，避免提交登录态、业务数据和凭证。
+- 明确禁止提交：
+  - `state.json`
+  - `*.db`
+  - `accounts.xlsx`、`inputs/*.xlsx`
+  - `数据导出_*.xlsx`、`latest.xlsx`
+  - `.runtime/`、`.runtime_api/`
+  - `*.env*`、`*.pem`、`*.key`
+- 文档补充发布前敏感信息自检命令与检查清单。
 
-### Fixed
-- 修复文档与仓库真实实现不一致问题。
-- 修复依赖声明不足导致环境初始化后看板/API无法直接运行的问题。
+### 文档更新
+- 重写 `README.md`：
+  - 项目定位与架构说明
+  - 桌面端详细使用步骤
+  - CLI 使用教程
+  - API 接入网站教程（提交/轮询/控制/取数 + 前后端示例）
+  - 常见问题排查
+  - 安全规范
+- 增强发布说明可执行性，降低交接和二次部署成本。
+
+### 发布前验收建议
+- [ ] 登录失效后，浏览器保持打开，手动继续可恢复任务。
+- [ ] 任务运行期间进度、日志、当前账号持续刷新。
+- [ ] 自定义导出目录写入成功，复制导出文件成功。
+- [ ] 同日多次运行历史导出不被覆盖。
+- [ ] API 轮询字段完整返回，网站前端可正常展示。
+- [ ] `python -m unittest discover -s tests -p 'test_*.py'` 通过。
+- [ ] Git 暂存区不含敏感文件与凭证。

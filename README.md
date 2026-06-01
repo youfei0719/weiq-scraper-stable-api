@@ -1,232 +1,177 @@
-# WEIQ 数据采集与分析（零基础可用版）
+# WEIQ 数据采集与变化追踪平台
 
-这份文档是给**没有编程基础**的同学写的。
-你可以把它当作“照着做就能跑起来”的操作手册。
+最近更新时间：**2026-04-12 20:58:41 CST (+0800, Asia/Shanghai)**
 
-## 你可以用它做什么
+## 1. 项目简介
 
-这个项目可以帮助你把一批账号的数据自动采集下来，并自动生成可视化分析面板。
+WEIQ 项目用于采集账号数据、记录字段变化，并对网站提供标准 API 接口。项目分为两条使用路径：
+- 桌面端（给运营/非技术同学）：图形化操作，扫码登录，任务可视化，导出可管理。
+- API 服务（给网站/后端）：任务提交、任务状态查询、账号最新数据与变化记录读取。
 
-完整流程是：
-- 准备账号表（Excel）
-- 运行采集程序（自动打开浏览器）
-- 得到采集结果（Excel）
-- 打开分析看板（图表）
+核心目标：
+- 把“手工采集 + 手工拷表”改成“任务化采集 + 可追溯存储 + 稳定接口输出”。
+- 处理登录失效、任务阻塞、导出管理等高频问题。
 
-你不需要先学会编程，按本文步骤执行即可。
+## 2. 当前版本能力总览
 
-## 先看这 3 件事
+- 登录阻塞可恢复：登录失效时浏览器保持打开，用户登录后点击“继续”再恢复任务。
+- 任务可观测：状态、进度、当前账号、结构化日志、错误码与中文提示可实时查看。
+- 旧库兼容：支持旧 SQLite 结构兼容运行，避免升级后直接报错卡死。
+- 多账号表运行：可选择 `inputs/` 下不同 Excel 作为任务输入源。
+- 导出增强：
+  - 运行前可指定导出目录；
+  - 运行后可把导出文件复制到任意目录；
+  - 历史文件不覆盖。
+- 认证等级识别（结构化优先）：
+  - 新增结果字段 `认证等级`；
+  - 判定顺序：接口字段 > DOM/SVG语义 > 资源名映射；
+  - 明确区分 `无认证` 与 `unknown`，默认不做颜色识别。
+- 网站接入友好：提供任务与账号数据查询 API，支持轮询集成。
 
-1. 你至少需要有一个 `uid` 列的账号表（Excel）。
-2. 第一次运行时会要求你在浏览器里登录 WEIQ，这是正常流程。
-3. 如果中途断了，可以用“断点续跑”继续，不会从头全部重跑。
-
-## 项目功能（通俗版）
-
-### 1) 采集引擎（`scraper.py`）
-- 自动打开网页并抓取账号指标。
-- 支持失败重试、冷却防风控、登录失效后恢复。
-- 每条数据会自动带上运行批次和错误信息，便于回溯。
-
-### 2) 分析看板（`main.py`）
-- 打开浏览器就能看图表，不需要你写 SQL。
-- 支持按 `run_id`（运行批次）筛选。
-
-### 3) API 服务（`cloud_api.py`，可选）
-- 给网站或后端接入用。
-- 可以创建任务、看进度、取消、继续、拉取结果。
-- 如果你只是自己手工跑一次，不用先学 API。
-
-## 目录结构
+## 3. 目录结构说明
 
 ```text
 .
-├── scraper.py       # 采集程序（最常用）
-├── main.py          # 数据分析看板
-├── cloud_api.py     # API 服务（可选）
-├── analytics.py     # 变化摘要与质量评分
-├── tests/           # 基础测试
-├── pyproject.toml
-└── README.md
+├── desktop_app.py            # 桌面端 UI（Streamlit）
+├── scraper.py                # 采集主引擎（CLI + 调度）
+├── cloud_api.py              # API 服务（FastAPI）
+├── src/weiq_core/            # 核心契约与通用模块
+├── tests/                    # 单元测试
+├── inputs/                   # 多账号输入表目录（本地使用，不提交仓库）
+├── data/                     # 中间数据目录
+├── weiq_local.db             # 本地 SQLite（本地使用，不提交仓库）
+└── CHANGELOG.md              # 更新日志
 ```
 
-## 一、Windows 教程（给零基础）
+## 4. 快速开始（非技术用户）
 
-> 建议使用 Windows Terminal / PowerShell。
+### 第 1 步：安装依赖
 
-### 第 1 步：安装 Python（只做一次）
-
-1. 打开 Python 官网下载 Python 3.12+。
-2. 安装时**勾选** `Add python.exe to PATH`。
-3. 安装完成后打开 PowerShell，执行：
-
-```powershell
-python --version
-```
-
-看到版本号（例如 `Python 3.12.x`）说明成功。
-
-### 第 2 步：进入项目目录
-
-假设你把项目放在桌面 `weiq-scraper-stable-api` 文件夹：
-
-```powershell
-cd $HOME\Desktop\weiq-scraper-stable-api
-```
-
-### 第 3 步：安装项目依赖（只做一次）
-
-```powershell
+```bash
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install playwright "psycopg[binary]" apscheduler streamlit plotly openpyxl pandas fastapi uvicorn
 python -m playwright install chromium --no-shell
 ```
 
-### 第 4 步：准备账号 Excel
+说明：
+- 如果你使用 `zsh`，`psycopg[binary]` 必须加引号。
+- `--no-shell` 可减少浏览器内核下载失败概率。
 
-在项目目录放一个 `accounts.xlsx` 文件，至少包含两列：
+### 第 2 步：启动桌面端
 
-- `账号ID`：你给账号起的名字（例如 客户A）
-- `uid`：账号唯一 ID（必填）
+- macOS：双击 `start_desktop.command`
+- Windows：双击 `start_desktop.bat`
+- 或命令行：
 
-示例：
+```bash
+python -m streamlit run desktop_app.py
+```
 
-| 账号ID | uid |
-| --- | --- |
-| 客户A | 123456 |
-| 客户B | 789012 |
+### 第 3 步：准备账号输入表
 
-### 第 5 步：开始采集
+在页面中进入“账号表管理”：
+- 没有模板时先生成模板；
+- 填写账号后上传到 `inputs/` 或直接在页面导入。
 
-```powershell
+建议字段：
+- `账号ID`（业务名称）
+- `uid`（唯一标识，必填）
+
+### 第 4 步：配置并启动任务
+
+页面“开始采集”区域按顺序设置：
+1. 选择输入表。
+2. 选择数据库模式（旧库兼容 / 新结构）。
+3. 设置导出目录（可自定义）。
+4. 点击“开始采集任务”。
+
+### 第 5 步：任务运行中如何看状态
+
+你会看到：
+- 状态（中文）
+- 进度条
+- 当前处理账号
+- 最近日志
+- 异常诊断
+
+关键状态说明：
+- `运行中`：正常采集。
+- `等待登录`：登录失效或风控，需要你在浏览器完成登录。
+- `已暂停`：人为暂停。
+- `失败`：任务已终止，查看错误码和日志。
+- `成功`：任务完成，可导出或供 API 读取。
+
+### 第 6 步：登录失效处理（重点）
+
+当页面提示登录失效时：
+1. 浏览器窗口会保持打开（不会自动关闭）。
+2. 你在浏览器里完成登录。
+3. 回到桌面端点击“登录后继续（手动）”。
+4. 系统先校验登录态，通过后恢复任务。
+
+### 第 7 步：导出与归档
+
+任务完成后：
+- 页面显示本次导出文件路径。
+- 可输入任意目标目录，点击“复制导出文件到目标目录”。
+- 原始导出保留，不覆盖历史。
+
+## 5. 技术用户 CLI 教程
+
+### 5.1 直接运行
+
+```bash
 python scraper.py
 ```
 
-说明：
-- 第一次会打开浏览器，提示你登录 WEIQ。
-- 登录完成后，回到终端按回车继续。
-- 采集完成后会生成 `weiq_results.xlsx`。
-
-### 第 6 步：打开分析看板
-
-```powershell
-python -m streamlit run main.py
-```
-
-终端会显示一个本地地址（通常是 `http://localhost:8501`），浏览器打开即可看图表。
-
-### 常用命令（Windows）
-
-自定义输入和输出目录：
-
-```powershell
-python scraper.py --input-excel .\accounts.xlsx --output-dir .\exports
-```
-
-禁用断点续跑：
-
-```powershell
-python scraper.py --no-resume
-```
-
-## 二、Mac 教程（给零基础）
-
-> 建议使用 macOS 自带 Terminal。
-
-### 第 1 步：安装 Python（只做一次）
-
-1. 安装 Python 3.12+（官网安装包或 Homebrew 均可）。
-2. 终端执行：
-
-```bash
-python3 --version
-```
-
-如果你机器是 `python` 命令，也可用 `python --version`。
-
-### 第 2 步：进入项目目录
-
-假设项目在桌面：
-
-```bash
-cd ~/Desktop/weiq-scraper-stable-api
-```
-
-### 第 3 步：安装项目依赖（只做一次）
-
-```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install -e .
-python3 -m playwright install chromium --no-shell
-```
-
-### 第 4 步：准备账号 Excel
-
-在项目目录放置 `accounts.xlsx`，至少包含：
-
-- `账号ID`
-- `uid`
-
-### 第 5 步：开始采集
-
-```bash
-python3 scraper.py
-```
-
-流程与 Windows 一样：
-- 第一次会弹浏览器登录
-- 登录后回终端按回车
-- 完成后输出 `weiq_results.xlsx`
-
-### 第 6 步：打开分析看板
-
-```bash
-python3 -m streamlit run main.py
-```
-
-打开终端给出的本地地址（通常 `http://localhost:8501`）。
-
-### 常用命令（Mac）
-
-自定义输入和输出目录：
-
-```bash
-python3 scraper.py --input-excel ./accounts.xlsx --output-dir ./exports
-```
-
-指定历史批次继续：
-
-```bash
-python3 scraper.py --run-id run_20260531_120000_ab12cd
-```
-
-## 三、最常用参数（看不懂可以先跳过）
+### 5.2 指定输入表与导出目录
 
 ```bash
 python scraper.py \
-  --input-excel ./accounts.xlsx \
-  --output-dir ./exports \
-  --output-excel weiq_results.xlsx \
-  --state-json ./state.json \
-  --state-storage ./crawl_state.json \
-  --cooldown-every 50 \
-  --cooldown-seconds 180 \
-  --retry-times 2 \
-  --retry-backoff-seconds 3
+  --input-excel /绝对路径/accounts.xlsx \
+  --output-dir /绝对路径/exports
 ```
 
-参数解释：
-- `--input-excel`：输入账号表
-- `--output-dir`：结果输出目录
-- `--state-json`：登录态缓存文件
-- `--state-storage`：断点续跑状态文件
-- `--retry-times`：失败重试次数
+### 5.3 数据库模式
 
-## 四、API 使用（可选）
+```bash
+# 旧库兼容模式
+python scraper.py --schema-mode legacy
 
-如果你要把采集接入网站/系统，可以启用 API。
+# 完整新结构模式
+python scraper.py --schema-mode full
+```
 
-### 启动 API
+### 5.4 周任务调度（示例）
+
+```bash
+python scraper.py --weekly --day-of-week mon --hour 3 --minute 0 --run-immediately
+```
+
+### 5.5 认证等级探针（4样本验收）
+
+```bash
+python scraper.py --probe-verify
+```
+
+说明：
+- 默认探针样本：`2115314532,6557986019,5099051423,7331622139`
+- 可自定义：
+
+```bash
+python scraper.py --probe-verify --probe-uids 2115314532,6557986019
+```
+
+探针会输出每个 uid 的：
+- `认证等级`（`黄V` / `橙V` / `金V` / `无认证` / `unknown`）
+- `证据来源`（例如 `api` / `dom` / `dom_unknown` / `dom_none`）
+- `线索预览`（类名、属性或接口字段片段）
+
+## 6. API 接入网站详细教程
+
+本节给网站开发同学，按“提交任务 -> 轮询 -> 控制 -> 拉取数据”落地。
+
+### 6.1 启动 API 服务
 
 ```bash
 python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080
@@ -238,71 +183,191 @@ python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080
 curl http://127.0.0.1:8080/health
 ```
 
-### API 功能
+### 6.2 提交采集任务
 
-- `POST /v1/tasks/crawl` 创建任务
-- `GET /v1/tasks/{task_id}` 查询状态
-- `POST /v1/tasks/{task_id}/cancel` 取消任务
-- `POST /v1/tasks/{task_id}/resume` 登录后继续
-- `GET /v1/tasks/{task_id}/latest` 获取任务结果
-- `GET /v1/tasks/{task_id}/quality` 查看质量评分
-- `GET /v1/accounts/{uid}/changes` 查看指标变化摘要
+接口：`POST /v1/tasks/crawl`
 
-## 五、常见问题（小白版）
+请求示例：
 
-### 1) 运行后没反应 / 卡住
+```bash
+curl -X POST "http://127.0.0.1:8080/v1/tasks/crawl" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "weiq",
+    "priority": 5,
+    "accounts": [
+      {"account_id": "客户A", "uid": "123456"},
+      {"account_id": "客户B", "uid": "789012"}
+    ]
+  }'
+```
 
-先看终端是不是在等你登录或验证码处理。
-很多时候不是程序死了，而是等人工处理风控。
+响应示例：
 
-### 2) 结果文件在哪里
+```json
+{
+  "task_id": "e7be...",
+  "status": "PENDING",
+  "status_zh": "排队中",
+  "progress": 0.0,
+  "message": "任务已创建"
+}
+```
 
-默认在当前目录：`weiq_results.xlsx`。
-如果你用了 `--output-dir`，去那个目录找。
+### 6.3 轮询任务状态
 
-### 3) 中断后如何继续
+接口：`GET /v1/tasks/{task_id}`
 
-再次运行同样命令即可，默认会根据 `crawl_state.json` 尝试续跑。
+建议轮询间隔：2~3 秒。
 
-### 4) 看板提示没有数据
+关键字段：
+- `status`：程序判断字段（英文）。
+- `status_zh`：页面展示字段（中文）。
+- `progress`：0~1。
+- `current_account`：当前账号。
+- `blocked_reason`：阻塞原因（如 `AUTH_REQUIRED`）。
+- `error_code`：错误码（英文）。
+- `error_message_zh`：错误中文解释。
+- `auth_waiting`：是否等待登录。
+- `resume_requested`：是否收到继续请求。
+- `auth_check_passed`：继续前登录校验是否通过。
+- `output_dir`：导出目录。
+- `export_file`：导出文件路径。
+
+终态判断：
+- 成功终态：`SUCCESS`
+- 失败终态：`FAILED`
+- 取消终态：`CANCELLED`
+
+### 6.4 控制任务（暂停/继续/取消）
+
+- `POST /v1/tasks/{task_id}/pause`
+- `POST /v1/tasks/{task_id}/resume`
+- `POST /v1/tasks/{task_id}/cancel`
+
+继续接口建议流程：
+1. 用户在浏览器完成登录。
+2. 前端点击“继续”。
+3. 后端调用 `/resume`。
+4. 再轮询 `/tasks/{task_id}`，确认从 `BLOCKED_AUTH` 回到 `RUNNING`。
+
+### 6.5 拉取采集结果数据
+
+- `GET /v1/accounts/{uid}/latest`：获取最新快照。
+- `GET /v1/accounts/{uid}/changes`：获取变化记录。
+
+典型页面流程：
+1. 先查 `latest` 渲染当前值。
+2. 再查 `changes` 渲染“最近变化历史”。
+
+### 6.6 网站前端接入示例（JavaScript）
+
+```js
+async function startAndTrack(payload) {
+  const createRes = await fetch('/api/proxy/v1/tasks/crawl', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const createData = await createRes.json();
+  const taskId = createData.task_id;
+
+  const timer = setInterval(async () => {
+    const res = await fetch(`/api/proxy/v1/tasks/${taskId}`);
+    const task = await res.json();
+
+    renderStatus(task.status_zh || task.status);
+    renderProgress(task.progress || 0);
+    renderCurrent(task.current_account || '-');
+
+    if (task.auth_waiting || task.status === 'BLOCKED_AUTH') {
+      showAuthNotice('请在浏览器完成登录后点击继续');
+    }
+
+    if (['SUCCESS', 'FAILED', 'CANCELLED'].includes(task.status)) {
+      clearInterval(timer);
+      onTaskFinished(task);
+    }
+  }, 2500);
+}
+```
+
+### 6.7 后端代理示例（Node.js）
+
+```js
+import express from 'express';
+import fetch from 'node-fetch';
+
+const app = express();
+app.use(express.json());
+
+const WEIQ_API = 'http://127.0.0.1:8080';
+
+app.post('/api/proxy/v1/tasks/crawl', async (req, res) => {
+  const r = await fetch(`${WEIQ_API}/v1/tasks/crawl`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(req.body)
+  });
+  res.status(r.status).json(await r.json());
+});
+
+app.get('/api/proxy/v1/tasks/:taskId', async (req, res) => {
+  const r = await fetch(`${WEIQ_API}/v1/tasks/${req.params.taskId}`);
+  res.status(r.status).json(await r.json());
+});
+
+app.listen(3000);
+```
+
+## 7. 常见问题与排查
+
+### 问题 1：点击开始后进度一直 0%
+
+排查顺序：
+1. 看任务日志是否出现 `DB_SCHEMA_MISMATCH` 或 `RUNTIME_CRASH`。
+2. 看子进程是否仍存活。
+3. 看 `heartbeat_at` 是否持续更新。
+4. 用“诊断”查看最后错误摘要。
+
+### 问题 2：登录页闪烁、反复跳转
+
+处理策略：
+- 等待登录态时采集流程停止导航；
+- 手动点击继续后才恢复；
+- 若仍失败，检查网络与风控并重试。
+
+### 问题 3：导出文件不在预期目录
 
 检查：
-- 是否已经成功生成 `weiq_results.xlsx`
-- 是否在正确目录运行 `streamlit`
-- 是否设置了错误的 `WEIQ_DATA_FILE`
+- 任务配置里的 `output_dir`。
+- 任务结果里的 `export_file`。
+- 如需归档，用“复制到目标目录”。
 
-## 六、运行结果里关键字段是什么意思
+## 8. 安全与敏感信息
 
-每条账号记录里新增了下面几个字段：
-
-- `run_id`：本次运行批次号
-- `crawl_time`：采集时间
-- `account_status`：该账号采集状态（SUCCESS / FAILED / SKIPPED）
-- `error_code`：失败类型代码
-- `error_message`：失败中文说明
-
-常见错误码：
-- `NONE`
-- `INVALID_UID`
-- `HTTP_BLOCKED`
-- `TIMEOUT`
-- `AUTH_REQUIRED`
-- `CAPTCHA_REQUIRED`
-- `EMPTY_PAGE`
-- `NAVIGATION_ERROR`
-- `WRITE_ERROR`
-- `CANCELLED`
-
-## 七、安全提醒（很重要）
-
-以下文件不要上传到公开仓库：
+严禁提交到仓库的内容：
 - `state.json`
-- `crawl_state.json`
 - `*.db`
-- `accounts.xlsx`
-- `weiq_results*.xlsx`
+- `accounts.xlsx`, `inputs/*.xlsx`
+- `数据导出_*.xlsx`, `latest.xlsx`
+- 任何 DSN、token、密码、cookie、私钥
 
-## 八、给第一次使用者的建议
+提交前建议执行：
 
-你可以先用 3~5 个账号做一轮小测试，确认流程没问题后，再跑全量任务。
-这样最稳、最省时间。
+```bash
+git status --short
+git diff --cached --name-only
+git grep -n "WEIQ_DB_DSN\|postgresql://\|password\|token\|state.json" || true
+```
+
+## 9. 开发与测试
+
+```bash
+python -m py_compile scraper.py desktop_app.py cloud_api.py src/weiq_core/contracts.py
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+## 10. 更新记录
+
+详细更新请查看：[CHANGELOG.md](./CHANGELOG.md)
