@@ -4,9 +4,13 @@ import time
 import os
 import re
 import sys
+import json
+import io
 import pandas as pd
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from PIL import Image
+import colorsys
 
 # ==========================================
 # 配置与全局变量定义区
@@ -15,6 +19,11 @@ INPUT_EXCEL = "accounts.xlsx"
 OUTPUT_EXCEL = "weiq_results.xlsx"
 STATE_JSON = "state.json"
 DEFAULT_PROBE_UIDS = ["2115314532", "6557986019", "5099051423", "7331622139"]
+VERIFY_FILL_MAP = {
+    ("#FFFFFF", "#F6CA45", "#FFFFFF"): "黄V",
+    ("#FFFFFF", "#FF6C00", "#FFFFFF"): "橙V",
+    ("#FEFF78", "#CD3620", "#FEFF78"): "金V",
+}
 
 global_request_count = 0
 
@@ -72,14 +81,262 @@ def _normalize_signal_text(raw):
     return text
 
 
+def _normalize_hex_color(raw):
+    text = str(raw or "").strip().upper()
+    if not text:
+        return ""
+    if re.fullmatch(r"#[0-9A-F]{3}", text):
+        return "#" + "".join(ch * 2 for ch in text[1:])
+    if re.fullmatch(r"#[0-9A-F]{6}", text):
+        return text
+    m = re.search(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", text.lower())
+    if m:
+        return "#{:02X}{:02X}{:02X}".format(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return text
+
+
+def _to_number_color_triplet(raw):
+    if not raw:
+        return None
+    m = re.search(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", str(raw).lower())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _color_distance(c1, c2):
+    return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2 + (c1[2] - c2[2]) ** 2) ** 0.5
+
+
+def _rgb_to_hsv_255(r, g, b):
+    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    return h * 360.0, s * 255.0, v * 255.0
+
+
+def _classify_hue_bucket(h):
+    # 经验区间：金红(偏红) < 橙 < 黄
+    if h < 12:
+        return "金V"
+    if h < 42:
+        return "橙V"
+    if h < 70:
+        return "黄V"
+    return None
+
+
+def _match_verify_level_from_rgb_text_signals(signals):
+    votes = {"金V": 0.0, "橙V": 0.0, "黄V": 0.0}
+    for s in signals:
+        text = str(s or "").lower()
+        for m in re.finditer(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", text):
+            r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            h, sat, val = _rgb_to_hsv_255(r, g, b)
+            if sat < 35 or val < 60:
+                continue
+            level = _classify_hue_bucket(h)
+            if not level:
+                continue
+            votes[level] += (sat / 255.0) * (val / 255.0)
+    total = sum(votes.values())
+    if total <= 0:
+        return None
+    ordered = sorted(votes.items(), key=lambda x: x[1], reverse=True)
+    top_level, top_score = ordered[0]
+    second_score = ordered[1][1]
+    ratio = top_score / total
+    margin = (top_score - second_score) / total
+    if top_level == "金V":
+        if ratio >= 0.72 and margin >= 0.26:
+            return "金V"
+        if votes["橙V"] >= top_score * 0.55:
+            return "橙V"
+        return None
+    if ratio >= 0.52 and margin >= 0.10:
+        return top_level
+    return None
+
+
+def _match_verify_level_by_semantic_color(signals):
+    # 仅在“昵称邻域已确认有认证图标但缺少语义 token”时作为样式语义兜底，不做像素取色。
+    colors = []
+    for s in signals:
+        t = str(s).lower()
+        if "style:color=" in t or "style:fill=" in t or "style:stroke=" in t:
+            for part in re.split(r"[;|]", t):
+                if "rgb(" in part:
+                    c = _to_number_color_triplet(part)
+                    if c:
+                        colors.append(c)
+    if not colors:
+        return None
+
+    # 排除低饱和灰阶，减少误把正文黑灰色当成认证色
+    colors = [c for c in colors if (max(c) - min(c)) >= 18]
+    if not colors:
+        return None
+
+    score = {"金V": 0.0, "橙V": 0.0, "黄V": 0.0}
+    total = 0.0
+    for r, g, b in colors:
+        h, s, v = _rgb_to_hsv_255(r, g, b)
+        if s < 35 or v < 70:
+            continue
+        level = _classify_hue_bucket(h)
+        if not level:
+            continue
+        w = (s / 255.0) * (v / 255.0)
+        score[level] += w
+        total += w
+
+    if total <= 0:
+        return None
+    ordered = sorted(score.items(), key=lambda x: x[1], reverse=True)
+    top_level, top_score = ordered[0]
+    second_score = ordered[1][1]
+    ratio = top_score / total
+    margin = (top_score - second_score) / total
+    # 金V门槛更严，防止橙V被暗红阴影误吸到金V
+    if top_level == "金V":
+        if ratio >= 0.72 and margin >= 0.26:
+            return top_level
+        if score.get("橙V", 0.0) >= top_score * 0.55:
+            return "橙V"
+        return None
+    if ratio >= 0.55 and margin >= 0.15:
+        return top_level
+    return None
+
+
+def _classify_verify_by_region_screenshot(page, dom_probe):
+    try:
+        rect = dom_probe.get("name_rect") or {}
+        card_rect = dom_probe.get("card_rect") or {}
+        nl = float(rect.get("left", 0))
+        nt = float(rect.get("top", 0))
+        nw = float(rect.get("width", 0))
+        nh = float(rect.get("height", 0))
+        cr = float(card_rect.get("right", 0))
+        cb = float(card_rect.get("bottom", 0))
+        if nw <= 0 or nh <= 0:
+            return None, {}
+
+        x = max(nl + nw - 2, 0)
+        y = max(nt - 6, 0)
+        max_w = max(cr - x - 2, 0)
+        w = min(140, max_w)
+        h = min(max(nh + 12, 24), max(cb - y - 2, 0))
+        if w < 12 or h < 12:
+            return None, {}
+
+        png = page.screenshot(clip={"x": x, "y": y, "width": w, "height": h})
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        pixels = img.get_flattened_data()
+        if not pixels:
+            return None, {}
+
+        hit_counts = {"金V": 0.0, "橙V": 0.0, "黄V": 0.0}
+        colorful_count = 0
+        valid_count = 0
+        for r, g, b in pixels:
+            if max(r, g, b) - min(r, g, b) < 20:
+                continue
+            colorful_count += 1
+            h_deg, s, v = _rgb_to_hsv_255(r, g, b)
+            if s < 45 or v < 85:
+                continue
+            level = _classify_hue_bucket(h_deg)
+            if not level:
+                continue
+            valid_count += 1
+            hit_counts[level] += (s / 255.0) * (v / 255.0)
+
+        # 区域内有效彩色像素过少，视为证据不足
+        if valid_count < 5:
+            return None, {"colorful_pixels": colorful_count, "valid_pixels": valid_count, "hit_scores": hit_counts}
+
+        level, score = max(hit_counts.items(), key=lambda x: x[1])
+        total_score = sum(hit_counts.values()) or 1.0
+        ordered = sorted(hit_counts.items(), key=lambda x: x[1], reverse=True)
+        ratio = score / total_score
+        margin = (ordered[0][1] - ordered[1][1]) / total_score
+        if level == "金V":
+            if ratio >= 0.72 and margin >= 0.26:
+                return level, {
+                    "clip": {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)},
+                    "colorful_pixels": colorful_count,
+                    "valid_pixels": valid_count,
+                    "hit_scores": hit_counts,
+                    "ratio": round(ratio, 4),
+                    "margin": round(margin, 4),
+                }
+            if hit_counts.get("橙V", 0.0) >= score * 0.55:
+                return "橙V", {
+                    "clip": {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)},
+                    "colorful_pixels": colorful_count,
+                    "valid_pixels": valid_count,
+                    "hit_scores": hit_counts,
+                    "ratio": round(ratio, 4),
+                    "margin": round(margin, 4),
+                    "demote_from_gold": True,
+                }
+            return None, {
+                "colorful_pixels": colorful_count,
+                "valid_pixels": valid_count,
+                "hit_scores": hit_counts,
+                "ratio": round(ratio, 4),
+                "margin": round(margin, 4),
+                "gold_conf_low": True,
+            }
+
+        if ratio >= 0.58 and margin >= 0.18:
+            return level, {
+                "clip": {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)},
+                "colorful_pixels": colorful_count,
+                "valid_pixels": valid_count,
+                "hit_scores": hit_counts,
+                "ratio": round(ratio, 4),
+                "margin": round(margin, 4),
+            }
+        return None, {
+            "colorful_pixels": colorful_count,
+            "valid_pixels": valid_count,
+            "hit_scores": hit_counts,
+            "ratio": round(ratio, 4),
+            "margin": round(margin, 4),
+        }
+    except Exception as e:
+        return None, {"error": str(e)}
+
+
+def _has_verify_semantic_hint(signals):
+    normalized = " | ".join(_normalize_signal_text(x) for x in signals if x)
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"(verify|verified|auth|badge|vip|renzheng|认证|gold|orange|yellow|huang|cheng|jin|hong|red|weibo[-_]?v|icon[-_]?v|vip[-_]?icon|金v|橙v|黄v)",
+            normalized,
+        )
+    )
+
+
 def _match_verify_level_from_signals(signals):
     normalized = " | ".join(_normalize_signal_text(x) for x in signals if x)
     if not normalized:
         return None
 
-    gold_tokens = ["金v", "goldv", "gold_v", "gold-", "v-gold", "v_gold", "goldenv", "金红"]
-    orange_tokens = ["橙v", "orangev", "orange_v", "orange-", "v-orange", "v_orange"]
-    yellow_tokens = ["黄v", "yellowv", "yellow_v", "yellow-", "v-yellow", "v_yellow"]
+    gold_tokens = [
+        "金v", "goldv", "gold_v", "gold-", "v-gold", "v_gold", "goldenv", "金红",
+        "redv", "red_v", "v-red", "jinv", "jin_v", "v-jin", "hongv", "hong_v",
+    ]
+    orange_tokens = [
+        "橙v", "orangev", "orange_v", "orange-", "v-orange", "v_orange",
+        "chengv", "cheng_v", "v-cheng",
+    ]
+    yellow_tokens = [
+        "黄v", "yellowv", "yellow_v", "yellow-", "v-yellow", "v_yellow",
+        "huangv", "huang_v", "v-huang",
+    ]
 
     for token in gold_tokens:
         if token in normalized:
@@ -124,6 +381,21 @@ def _extract_api_verify_clues(payload):
     return clues
 
 
+def _extract_json_from_text_payload(text):
+    # 兼容 text/plain 包裹 JSON 的接口
+    if not text:
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    if raw.startswith("{") or raw.startswith("["):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
+
+
 def _resolve_verify_level_from_api_payloads(api_payloads):
     all_clues = []
     for item in api_payloads:
@@ -132,13 +404,91 @@ def _resolve_verify_level_from_api_payloads(api_payloads):
     return _match_verify_level_from_signals(all_clues), all_clues
 
 
+def _extract_verify_level_from_exact_svg(page):
+    js = r"""
+    () => {
+      const out = {
+        has_profile_card: false,
+        has_name_row: false,
+        has_verify_icon: false,
+        has_verify_text: false,
+        has_unverified_hint: false,
+        verify_text_value: '',
+        svg_found: false,
+        svg_class: '',
+        svg_html: '',
+        path_fills: [],
+        top_lines: []
+      };
+
+      const all = Array.from(document.querySelectorAll('*'));
+      const card = all.find(el => {
+        const t = (el.innerText || '').trim();
+        return t.includes('UID') && t.includes('粉丝数') && t.includes('博文总数');
+      });
+      if (!card) return out;
+
+      out.has_profile_card = true;
+      const topLines = (card.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, 20);
+      out.top_lines = topLines;
+
+      const normalize = (s) => String(s || '').replace(/\s+/g, '');
+      const isNegative = (s) => {
+        const v = normalize(s).toLowerCase();
+        if (!v) return false;
+        if (/^[-—–~～_=·*xX\/]+$/.test(v)) return true;
+        if (['无', '暂无', '未认证', 'none', 'null', 'na', 'n/a'].includes(v)) return true;
+        return false;
+      };
+
+      let verifyTextValue = '';
+      for (const line of topLines) {
+        if (!line.includes('认证信息')) continue;
+        const m = line.match(/认证信息\s*[：:]?\s*(.*)$/);
+        const tail = m ? (m[1] || '') : line.split('认证信息').slice(1).join('');
+        const cleaned = String(tail || '').trim();
+        if (cleaned && !verifyTextValue) verifyTextValue = cleaned;
+      }
+      out.verify_text_value = verifyTextValue;
+      out.has_verify_text = Boolean(verifyTextValue && !isNegative(verifyTextValue));
+      out.has_unverified_hint = Boolean(verifyTextValue) && isNegative(verifyTextValue);
+
+      const nameRow = card.querySelector('.user-name-text.pointer');
+      if (!nameRow) return out;
+
+      out.has_name_row = true;
+      const svg = nameRow.querySelector('svg.gl-icon-default.icon.v.ml4');
+      if (!svg) return out;
+
+      out.has_verify_icon = true;
+      out.svg_found = true;
+      out.svg_class = svg.getAttribute('class') || '';
+      out.svg_html = (svg.outerHTML || '').slice(0, 1600);
+      out.path_fills = Array.from(svg.querySelectorAll('path'))
+        .map(p => p.getAttribute('fill') || '')
+        .filter(Boolean);
+      return out;
+    }
+    """
+    return page.evaluate(js)
+
+
 def _probe_verify_dom(page):
     js = r"""
     () => {
       const out = {
         has_verify_icon: false,
+        has_profile_card: false,
         has_verify_text: false,
+        has_unverified_hint: false,
+        has_name_row: false,
+        verify_text_value: '',
+        name_rect: null,
+        card_rect: null,
         signals: [],
+        name_row_signals: [],
+        icon_style_signals: [],
+        icon_nodes: [],
         top_lines: []
       };
 
@@ -168,45 +518,308 @@ def _probe_verify_dom(page):
       if (!card) {
         return out;
       }
+      out.has_profile_card = true;
+      const _cr = card.getBoundingClientRect();
+      out.card_rect = {left: _cr.left, top: _cr.top, right: _cr.right, bottom: _cr.bottom, width: _cr.width, height: _cr.height};
 
       const topLines = (card.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, 20);
       out.top_lines = topLines;
-      out.has_verify_text = topLines.some(line => line.includes('认证信息'));
+      const normalize = (s) => String(s || '').replace(/\s+/g, '');
+      const isNegative = (s) => {
+        const v = normalize(s).toLowerCase();
+        if (!v) return false;
+        if (/^[-—–~～_=·*xX\/]+$/.test(v)) return true;
+        if (['无', '暂无', '未认证', 'none', 'null', 'na', 'n/a'].includes(v)) return true;
+        return false;
+      };
+      let verifyTextValue = '';
+      for (const line of topLines) {
+        if (!line.includes('认证信息')) continue;
+        const m = line.match(/认证信息\s*[：:]?\s*(.*)$/);
+        const tail = m ? (m[1] || '') : line.split('认证信息').slice(1).join('');
+        const cleaned = String(tail || '').trim();
+        if (cleaned && !verifyTextValue) verifyTextValue = cleaned;
+      }
+      out.verify_text_value = verifyTextValue;
+      out.has_verify_text = Boolean(verifyTextValue && !isNegative(verifyTextValue));
+      out.has_unverified_hint = Boolean(verifyTextValue) && isNegative(verifyTextValue);
 
-      const nodes = Array.from(card.querySelectorAll('img,svg,use,i,span,em,a,div'));
-      const signalSet = new Set();
-      const sizeHintNodes = [];
+      const uidTextNode = Array.from(card.querySelectorAll('*')).find(el => {
+        const t = (el.innerText || '').trim();
+        return t.startsWith('UID：') || t.startsWith('UID:') || /^UID[：:]\s*\d+/.test(t);
+      });
 
-      for (const node of nodes) {
-        const tag = node.tagName.toLowerCase();
-        const attrs = [];
-        for (const key of ['class', 'src', 'href', 'xlink:href', 'style', 'title', 'aria-label', 'alt', 'data-type', 'data-level', 'data-verify', 'data-vip']) {
-          const v = node.getAttribute && node.getAttribute(key);
-          if (v) attrs.push(`${key}=${v}`);
-        }
-        const raw = attrs.join(' ').toLowerCase();
-        const hasKeyword = /(verify|verified|auth|badge|vip|renzheng|认证|gold|orange|yellow|huang|cheng|jin|金v|橙v|黄v|\\bv\\b)/.test(raw);
-        if (hasKeyword && raw.length > 0) {
-          signalSet.add(raw);
-        }
-
-        if (tag === 'img' || tag === 'svg' || tag === 'use') {
-          const rect = node.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0 && rect.width <= 24 && rect.height <= 24) {
-            sizeHintNodes.push(node);
+      const cardRect = card.getBoundingClientRect();
+      let nameRow = null;
+      let nicknameEl = null;
+      if (uidTextNode && uidTextNode.parentElement) {
+        const siblings = Array.from(uidTextNode.parentElement.children);
+        const uidIdx = siblings.indexOf(uidTextNode);
+        if (uidIdx > 0) {
+          const prev = siblings[uidIdx - 1];
+          const prevText = (prev.innerText || '').trim();
+          if (prevText && !prevText.includes('UID') && prevText.length <= 40) {
+            nameRow = prev;
+            nicknameEl = prev;
           }
         }
       }
 
-      out.has_verify_icon = sizeHintNodes.length > 0;
+      const uidRect = uidTextNode ? uidTextNode.getBoundingClientRect() : null;
+      const maybeNames = Array.from(card.querySelectorAll('*')).filter(el => {
+          if (!el || !el.getBoundingClientRect) return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 16 || rect.height < 12) return false;
+          const text = (el.innerText || '').trim();
+          if (!text || text.includes('UID') || text.includes('粉丝数') || text.includes('博文总数')) return false;
+          if (text.length > 40) return false;
+          if (uidRect) {
+            const dy = Math.abs(rect.top - uidRect.top);
+            if (dy > 90 && rect.bottom > uidRect.top) return false;
+            if (rect.bottom > uidRect.top + 8) return false;
+          }
+          if (rect.left < cardRect.left - 2 || rect.right > cardRect.right + 2) return false;
+          return true;
+      }).sort((a,b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        const da = uidRect ? Math.abs(ra.bottom - uidRect.top) + Math.abs(ra.left - cardRect.left) : ra.top;
+        const db = uidRect ? Math.abs(rb.bottom - uidRect.top) + Math.abs(rb.left - cardRect.left) : rb.top;
+        return da - db;
+      });
+
+      if (!nicknameEl && maybeNames.length) {
+        nicknameEl = maybeNames[0];
+        nameRow = nicknameEl.parentElement || nicknameEl;
+      }
+
+      if (!nicknameEl) {
+        return out;
+      }
+
+      out.has_name_row = true;
+      const nr = nicknameEl.getBoundingClientRect();
+      out.name_rect = {left: nr.left, top: nr.top, right: nr.right, bottom: nr.bottom, width: nr.width, height: nr.height};
+
+      const signalSet = new Set();
+      const nameRowSignalSet = new Set();
+      const iconStyleSet = new Set();
+      const iconNodes = [];
+
+      const collectAttrs = (el) => {
+        const attrs = [];
+        for (const n of ['class', 'title', 'aria-label', 'alt', 'src', 'data-type', 'data-v', 'data-level', 'href']) {
+          const v = el.getAttribute && el.getAttribute(n);
+          if (v) attrs.push(`${n}=${v}`);
+        }
+        return attrs;
+      };
+
+      const addComputedStyleSignals = (el, targetSet, styleTarget) => {
+        try {
+          const cs = getComputedStyle(el);
+          ['color', 'fill', 'stroke', 'backgroundColor', 'borderTopColor', 'borderLeftColor'].forEach(k => {
+            const v = cs[k];
+            if (v && v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') {
+              const s = `style:${k}=${v}`;
+              targetSet.add(s);
+              styleTarget.add(s);
+            }
+          });
+        } catch (e) {}
+      };
+
+      const collectPseudoSignals = (el, label) => {
+        if (!el) return;
+        ['::before', '::after'].forEach(pseudo => {
+          try {
+            const cs = getComputedStyle(el, pseudo);
+            if (!cs) return;
+            const content = cs.content || '';
+            const bg = cs.backgroundImage || '';
+            const mask = cs.maskImage || cs.webkitMaskImage || '';
+            const width = cs.width || '';
+            const height = cs.height || '';
+            const color = cs.color || '';
+            const fill = cs.fill || '';
+            const stroke = cs.stroke || '';
+            const visible = (
+              (content && content !== 'none' && content !== 'normal' && content !== '""') ||
+              (bg && bg !== 'none') ||
+              (mask && mask !== 'none')
+            );
+            if (visible) {
+              const summary = `${label}${pseudo}|content=${content}|bg=${bg}|mask=${mask}|w=${width}|h=${height}`;
+              signalSet.add(summary.toLowerCase());
+              nameRowSignalSet.add(summary.toLowerCase());
+              ['color', 'fill', 'stroke'].forEach((k) => {
+                const v = ({color, fill, stroke})[k];
+                if (v && v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') {
+                  const s = `pseudo:${label}${pseudo}:${k}=${v}`;
+                  signalSet.add(s.toLowerCase());
+                  nameRowSignalSet.add(s.toLowerCase());
+                  iconStyleSet.add(s.toLowerCase());
+                }
+              });
+            }
+          } catch (e) {}
+        });
+      };
+
+      const nearIconCandidates = Array.from(card.querySelectorAll('svg, img, i, use, span, div')).filter(el => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 8 || rect.height < 8 || rect.width > 40 || rect.height > 40) return false;
+        const nearY = rect.bottom >= nr.top - 8 && rect.top <= nr.bottom + 8;
+        const nearX = rect.left >= nr.right - 4 && rect.left <= nr.right + 180;
+        return nearX && nearY;
+      });
+
+      for (const el of nearIconCandidates) {
+        const rect = el.getBoundingClientRect();
+        const attrs = collectAttrs(el);
+        const text = (el.innerText || '').trim();
+        const summary = `${el.tagName.toLowerCase()}|w=${Math.round(rect.width)}|h=${Math.round(rect.height)}|${attrs.join(' | ')}|text=${text}`;
+        iconNodes.push(summary);
+        signalSet.add(summary.toLowerCase());
+        addComputedStyleSignals(el, signalSet, iconStyleSet);
+        if (el.querySelectorAll) {
+          const paths = Array.from(el.querySelectorAll('path')).slice(0, 6);
+          for (const p of paths) {
+            const fill = p.getAttribute('fill');
+            const stroke = p.getAttribute('stroke');
+            if (fill) signalSet.add(`path:fill=${fill}`.toLowerCase());
+            if (stroke) signalSet.add(`path:stroke=${stroke}`.toLowerCase());
+          }
+        }
+      }
+
+      // 扫描昵称同层和父层的直接子元素，兼容“昵称文本”和“v图标”为兄弟节点的场景
+      const siblingPools = [];
+      if (nicknameEl.parentElement) siblingPools.push(...Array.from(nicknameEl.parentElement.children));
+      if (nameRow && nameRow.parentElement) siblingPools.push(...Array.from(nameRow.parentElement.children));
+      const dedupSiblings = Array.from(new Set(siblingPools)).filter(Boolean);
+      let siblingIconHit = false;
+      for (const sib of dedupSiblings) {
+        if (sib === nicknameEl || sib === nameRow) continue;
+        if (!sib.getBoundingClientRect) continue;
+        const r = sib.getBoundingClientRect();
+        const nearY = r.bottom >= nr.top - 10 && r.top <= nr.bottom + 10;
+        const nearX = r.left >= nr.right - 6 && r.left <= nr.right + 200;
+        if (!nearX || !nearY) continue;
+        if (r.width < 8 || r.height < 8 || r.width > 48 || r.height > 48) continue;
+        const attrs = collectAttrs(sib);
+        const summary = `${sib.tagName.toLowerCase()}|w=${Math.round(r.width)}|h=${Math.round(r.height)}|${attrs.join(' | ').toLowerCase()}`;
+        iconNodes.push(summary);
+        signalSet.add(summary);
+        nameRowSignalSet.add(summary);
+        addComputedStyleSignals(sib, nameRowSignalSet, iconStyleSet);
+        siblingIconHit = true;
+      }
+
+      // 关键兜底：很多站点把认证图标做成昵称元素的伪元素，而非真实节点
+      collectPseudoSignals(nicknameEl, 'nickname');
+      collectPseudoSignals(nameRow, 'name_row');
+      if (nicknameEl && nicknameEl.parentElement) {
+        collectPseudoSignals(nicknameEl.parentElement, 'name_parent');
+      }
+
+      out.has_verify_icon = nearIconCandidates.length > 0 || siblingIconHit || pseudoIconHit;
       out.signals = Array.from(signalSet).slice(0, 80);
+      out.name_row_signals = Array.from(nameRowSignalSet).slice(0, 120);
+      out.icon_style_signals = Array.from(iconStyleSet).slice(0, 80);
+      out.icon_nodes = iconNodes.slice(0, 30);
       return out;
     }
     """
     return page.evaluate(js)
 
 
+def _extract_inline_verify_clues(page):
+    js = r"""
+    () => {
+      const out = [];
+      const max = 300;
+      const verifyRe = /(verify|verified|auth|vip|badge|renzheng|认证|v[_-]?type|gold|orange|yellow|jin|cheng|huang|hong|red|金v|橙v|黄v)/i;
+
+      const push = (x) => {
+        if (!x) return;
+        if (out.length >= max) return;
+        out.push(String(x).slice(0, 300));
+      };
+
+      const walk = (node, path, depth) => {
+        if (depth > 7 || out.length >= max) return;
+        if (Array.isArray(node)) {
+          for (let i = 0; i < Math.min(node.length, 50); i++) walk(node[i], `${path}[${i}]`, depth + 1);
+          return;
+        }
+        if (node && typeof node === 'object') {
+          for (const k of Object.keys(node).slice(0, 80)) {
+            const v = node[k];
+            const kp = `${path}.${k}`;
+            if (verifyRe.test(k)) push(`${kp}=${typeof v === 'object' ? '[obj]' : String(v)}`);
+            walk(v, kp, depth + 1);
+          }
+          return;
+        }
+        if (typeof node === 'string' && verifyRe.test(node)) push(`${path}=${node}`);
+      };
+
+      const globals = ['__INITIAL_STATE__', '__NUXT__', '__NEXT_DATA__', '__APOLLO_STATE__', '__PINIA__'];
+      for (const g of globals) {
+        try {
+          if (window[g]) walk(window[g], `window.${g}`, 0);
+        } catch (e) {}
+      }
+
+      const scripts = Array.from(document.querySelectorAll('script[type="application/json"],script'));
+      for (const s of scripts.slice(0, 60)) {
+        const txt = (s.textContent || '').trim();
+        if (!txt) continue;
+        if (!verifyRe.test(txt)) continue;
+        push(`script:${txt.slice(0, 240)}`);
+      }
+      return out;
+    }
+    """
+    try:
+        return page.evaluate(js)
+    except Exception:
+        return []
+
+
 def extract_verify_level(page, api_verify_payloads):
+    svg_probe = _extract_verify_level_from_exact_svg(page)
+    fills = tuple(_normalize_hex_color(x) for x in svg_probe.get("path_fills", []))
+    exact_level = VERIFY_FILL_MAP.get(fills)
+    if exact_level:
+        return exact_level, {
+            "source": "dom_svg_exact",
+            "fills": list(fills),
+            "svg_class": svg_probe.get("svg_class", ""),
+            "svg_html": svg_probe.get("svg_html", ""),
+            "top_lines": svg_probe.get("top_lines", [])[:12],
+        }
+
+    if svg_probe.get("has_profile_card") and svg_probe.get("has_name_row") and not svg_probe.get("has_verify_icon"):
+        if svg_probe.get("has_unverified_hint") or not svg_probe.get("has_verify_text"):
+            return "无认证", {
+                "source": "dom_svg_absent",
+                "verify_text_value": svg_probe.get("verify_text_value", ""),
+                "top_lines": svg_probe.get("top_lines", [])[:12],
+            }
+
+    if svg_probe.get("has_verify_icon"):
+        return "unknown", {
+            "source": "dom_svg_unknown",
+            "fills": list(fills),
+            "svg_class": svg_probe.get("svg_class", ""),
+            "svg_html": svg_probe.get("svg_html", ""),
+            "verify_text_value": svg_probe.get("verify_text_value", ""),
+            "top_lines": svg_probe.get("top_lines", [])[:12],
+        }
+
     api_level, api_clues = _resolve_verify_level_from_api_payloads(api_verify_payloads)
     if api_level:
         return api_level, {
@@ -214,26 +827,10 @@ def extract_verify_level(page, api_verify_payloads):
             "clues": api_clues[:20],
         }
 
-    dom_probe = _probe_verify_dom(page)
-    dom_level = _match_verify_level_from_signals(dom_probe.get("signals", []))
-    if dom_level:
-        return dom_level, {
-            "source": "dom",
-            "signals": dom_probe.get("signals", [])[:20],
-            "top_lines": dom_probe.get("top_lines", [])[:12],
-        }
-
-    has_verify_text = bool(dom_probe.get("has_verify_text"))
-    has_verify_icon = bool(dom_probe.get("has_verify_icon"))
-    if has_verify_icon or has_verify_text:
-        return "unknown", {
-            "source": "dom_unknown",
-            "signals": dom_probe.get("signals", [])[:20],
-            "top_lines": dom_probe.get("top_lines", [])[:12],
-        }
-    return "无认证", {
-        "source": "dom_none",
-        "top_lines": dom_probe.get("top_lines", [])[:12],
+    return "unknown", {
+        "source": "no_exact_signal",
+        "verify_text_value": svg_probe.get("verify_text_value", ""),
+        "top_lines": svg_probe.get("top_lines", [])[:12],
     }
 
 
@@ -243,12 +840,25 @@ def _start_verify_response_capture(page):
     def _on_response(response):
         try:
             ctype = (response.headers or {}).get("content-type", "").lower()
-            if "json" not in ctype:
-                return
             url_l = response.url.lower()
-            if not any(t in url_l for t in ["weibo", "detail", "account", "user", "profile", "weiq"]):
+            if not any(t in url_l for t in ["weibo", "detail", "account", "user", "profile", "weiq", "api"]):
                 return
-            payload = response.json()
+
+            payload = None
+            if "json" in ctype:
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = None
+            if payload is None:
+                try:
+                    text_payload = response.text()
+                    payload = _extract_json_from_text_payload(text_payload)
+                except Exception:
+                    payload = None
+            if payload is None:
+                return
+
             clues = _extract_api_verify_clues(payload)
             if clues:
                 api_payloads.append({"url": response.url, "clues": clues[:120]})
@@ -448,6 +1058,23 @@ def process_account_url(page, account_id, url, current_idx, total_accounts, metr
         
         check_anti_spider(page)
         verify_level, verify_debug = extract_verify_level(page, api_verify_payloads)
+        if verify_level in ("unknown", "无认证"):
+            source = verify_debug.get("source", "unknown")
+            preview = ""
+            if verify_debug.get("icons"):
+                preview = str(verify_debug["icons"][0])[:120]
+            elif verify_debug.get("signals"):
+                preview = str(verify_debug["signals"][0])[:120]
+            elif verify_debug.get("svg_html"):
+                preview = str(verify_debug["svg_html"])[:120]
+            extra = ""
+            if verify_debug.get("verify_text_value"):
+                extra += f" verify_text={str(verify_debug.get('verify_text_value'))[:40]}"
+            if verify_debug.get("fills"):
+                extra += f" fills={verify_debug.get('fills')}"
+            if verify_debug.get("region_debug"):
+                extra += f" region={str(verify_debug.get('region_debug'))[:120]}"
+            print(f"{progress} ⚠️ 认证等级={verify_level}（source={source}）{(' 线索=' + preview) if preview else ''}{extra}")
         if metrics_enabled:
             extracted_data = extract_metrics(page)
         
