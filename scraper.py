@@ -570,151 +570,230 @@ def _probe_verify_dom(page):
           if (!el || !el.getBoundingClientRect) return false;
           const rect = el.getBoundingClientRect();
           if (rect.width < 16 || rect.height < 12) return false;
-          const text = (el.innerText || '').trim();
-          if (!text || text.includes('UID') || text.includes('粉丝数') || text.includes('博文总数')) return false;
-          if (text.length > 40) return false;
+          if (rect.top < cardRect.top || rect.bottom > cardRect.bottom + 1) return false;
+          const t = (el.innerText || '').trim();
+          if (!t) return false;
+          if (t.includes('UID') || t.includes('粉丝数') || t.includes('博文总数') || t.includes('转评赞总数')) return false;
+          if (t.length > 30) return false;
           if (uidRect) {
-            const dy = Math.abs(rect.top - uidRect.top);
-            if (dy > 90 && rect.bottom > uidRect.top) return false;
-            if (rect.bottom > uidRect.top + 8) return false;
+            if (rect.top > uidRect.top) return false;
+            if ((uidRect.top - rect.top) > 80) return false;
           }
-          if (rect.left < cardRect.left - 2 || rect.right > cardRect.right + 2) return false;
           return true;
-      }).sort((a,b) => {
-        const ra = a.getBoundingClientRect();
-        const rb = b.getBoundingClientRect();
-        const da = uidRect ? Math.abs(ra.bottom - uidRect.top) + Math.abs(ra.left - cardRect.left) : ra.top;
-        const db = uidRect ? Math.abs(rb.bottom - uidRect.top) + Math.abs(rb.left - cardRect.left) : rb.top;
-        return da - db;
-      });
+        });
 
-      if (!nicknameEl && maybeNames.length) {
+      if (!nicknameEl && maybeNames.length > 0) {
+        maybeNames.sort((a, b) => {
+          const ar = a.getBoundingClientRect();
+          const br = b.getBoundingClientRect();
+          const ay = uidRect ? Math.abs(uidRect.top - ar.top) : ar.top;
+          const by = uidRect ? Math.abs(uidRect.top - br.top) : br.top;
+          if (ay !== by) return ay - by;
+          return ar.left - br.left;
+        });
         nicknameEl = maybeNames[0];
+      }
+
+      if (!nameRow && nicknameEl) {
         nameRow = nicknameEl.parentElement || nicknameEl;
       }
 
-      if (!nicknameEl) {
-        return out;
+      // 二次兜底：按 UID 上方近邻文本推断昵称行（解决“昵称与 UID 非同父结构”的页面）
+      if (!nicknameEl && uidRect) {
+        const textCandidates = Array.from(card.querySelectorAll('*')).filter(el => {
+          if (!el || !el.getBoundingClientRect) return false;
+          const t = (el.innerText || '').trim();
+          if (!t) return false;
+          if (t.includes('UID') || t.includes('粉丝数') || t.includes('博文总数') || t.includes('转评赞总数')) return false;
+          if (t.length > 30) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width < 12 || r.height < 12) return false;
+          if (r.bottom > uidRect.top + 8) return false;
+          if (r.top < uidRect.top - 110) return false;
+          if (r.left < cardRect.left - 2 || r.right > cardRect.right + 2) return false;
+          return true;
+        });
+        if (textCandidates.length > 0) {
+          textCandidates.sort((a, b) => {
+            const ar = a.getBoundingClientRect();
+            const br = b.getBoundingClientRect();
+            const dy = Math.abs(uidRect.top - ar.bottom) - Math.abs(uidRect.top - br.bottom);
+            if (dy !== 0) return dy;
+            return (br.width - ar.width);
+          });
+          nicknameEl = textCandidates[0];
+          nameRow = nicknameEl.parentElement || nicknameEl;
+        }
       }
 
-      out.has_name_row = true;
-      const nr = nicknameEl.getBoundingClientRect();
-      out.name_rect = {left: nr.left, top: nr.top, right: nr.right, bottom: nr.bottom, width: nr.width, height: nr.height};
+      if (!nameRow && maybeNames.length > 0) {
+        for (const el of maybeNames) {
+          if (el.querySelector && el.querySelector('img,svg,use,i,span,em')) {
+            nameRow = el;
+            nicknameEl = el;
+            break;
+          }
+        }
+      }
 
+      if (!nameRow) {
+        return out;
+      }
+      out.has_name_row = true;
+
+      const nameRect = nicknameEl && nicknameEl.getBoundingClientRect ? nicknameEl.getBoundingClientRect() : nameRow.getBoundingClientRect();
+      const rowRect = nameRow.getBoundingClientRect();
+      out.name_rect = {left: nameRect.left, top: nameRect.top, right: nameRect.right, bottom: nameRect.bottom, width: nameRect.width, height: nameRect.height};
+
+      const nodes = Array.from(nameRow.querySelectorAll('*'));
       const signalSet = new Set();
       const nameRowSignalSet = new Set();
       const iconStyleSet = new Set();
       const iconNodes = [];
+      let siblingIconHit = false;
+      let pseudoIconHit = false;
 
-      const collectAttrs = (el) => {
-        const attrs = [];
-        for (const n of ['class', 'title', 'aria-label', 'alt', 'src', 'data-type', 'data-v', 'data-level', 'href']) {
-          const v = el.getAttribute && el.getAttribute(n);
-          if (v) attrs.push(`${n}=${v}`);
+      const addComputedStyleSignals = (node, bucket, iconBucket) => {
+        const style = window.getComputedStyle(node);
+        if (!style) return;
+        const keys = ['color', 'fill', 'stroke', 'backgroundImage', 'backgroundColor', 'filter'];
+        for (const key of keys) {
+          const v = style[key];
+          if (!v) continue;
+          const val = String(v).trim();
+          if (!val || val === 'none') continue;
+          const signal = `style:${key}=${val}`;
+          bucket.add(signal);
+          if (iconBucket) iconBucket.add(signal);
         }
+      };
+
+      const collectAttrs = (node) => {
+        const attrs = [];
+        for (const key of ['class', 'src', 'href', 'xlink:href', 'style', 'title', 'aria-label', 'alt', 'data-type', 'data-level', 'data-verify', 'data-vip', 'name']) {
+          const v = node.getAttribute && node.getAttribute(key);
+          if (v) attrs.push(`${key}=${v}`);
+        }
+        const text = ((node.textContent || '') + '').trim();
+        if (text && text.length <= 20) attrs.push(`text=${text}`);
         return attrs;
       };
 
-      const addComputedStyleSignals = (el, targetSet, styleTarget) => {
-        try {
-          const cs = getComputedStyle(el);
-          ['color', 'fill', 'stroke', 'backgroundColor', 'borderTopColor', 'borderLeftColor'].forEach(k => {
-            const v = cs[k];
-            if (v && v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') {
-              const s = `style:${k}=${v}`;
-              targetSet.add(s);
-              styleTarget.add(s);
-            }
-          });
-        } catch (e) {}
-      };
-
-      const collectPseudoSignals = (el, label) => {
-        if (!el) return;
-        ['::before', '::after'].forEach(pseudo => {
+      const collectPseudoSignals = (node, label) => {
+        if (!node || !window.getComputedStyle) return;
+        for (const pseudo of ['::before', '::after']) {
+          let st = null;
           try {
-            const cs = getComputedStyle(el, pseudo);
-            if (!cs) return;
-            const content = cs.content || '';
-            const bg = cs.backgroundImage || '';
-            const mask = cs.maskImage || cs.webkitMaskImage || '';
-            const width = cs.width || '';
-            const height = cs.height || '';
-            const color = cs.color || '';
-            const fill = cs.fill || '';
-            const stroke = cs.stroke || '';
-            const visible = (
-              (content && content !== 'none' && content !== 'normal' && content !== '""') ||
-              (bg && bg !== 'none') ||
-              (mask && mask !== 'none')
-            );
-            if (visible) {
-              const summary = `${label}${pseudo}|content=${content}|bg=${bg}|mask=${mask}|w=${width}|h=${height}`;
-              signalSet.add(summary.toLowerCase());
-              nameRowSignalSet.add(summary.toLowerCase());
-              ['color', 'fill', 'stroke'].forEach((k) => {
-                const v = ({color, fill, stroke})[k];
-                if (v && v !== 'rgba(0, 0, 0, 0)' && v !== 'transparent') {
-                  const s = `pseudo:${label}${pseudo}:${k}=${v}`;
-                  signalSet.add(s.toLowerCase());
-                  nameRowSignalSet.add(s.toLowerCase());
-                  iconStyleSet.add(s.toLowerCase());
-                }
-              });
-            }
-          } catch (e) {}
-        });
+            st = window.getComputedStyle(node, pseudo);
+          } catch (e) {
+            st = null;
+          }
+          if (!st) continue;
+
+          const content = String(st.content || '').trim();
+          const width = String(st.width || '').trim();
+          const height = String(st.height || '').trim();
+          const color = String(st.color || '').trim();
+          const fill = String(st.fill || '').trim();
+          const stroke = String(st.stroke || '').trim();
+          const bg = String(st.backgroundImage || '').trim();
+          const bgc = String(st.backgroundColor || '').trim();
+          const mask = String(st.maskImage || st.webkitMaskImage || '').trim();
+
+          const styleLine = `pseudo:${label}:${pseudo}|content=${content}|w=${width}|h=${height}|color=${color}|fill=${fill}|stroke=${stroke}|bg=${bg}|bgc=${bgc}|mask=${mask}`.toLowerCase();
+          nameRowSignalSet.add(styleLine);
+          signalSet.add(styleLine);
+          iconStyleSet.add(`style:color=${color}`);
+          iconStyleSet.add(`style:fill=${fill}`);
+          iconStyleSet.add(`style:stroke=${stroke}`);
+          iconStyleSet.add(`style:backgroundColor=${bgc}`);
+
+          const hasVisual = (
+            (content && content !== 'none' && content !== 'normal' && content !== '""' && content !== "''") ||
+            (bg && bg !== 'none') ||
+            (mask && mask !== 'none')
+          );
+          if (hasVisual) pseudoIconHit = true;
+        }
       };
 
-      const nearIconCandidates = Array.from(card.querySelectorAll('svg, img, i, use, span, div')).filter(el => {
-        if (!el || !el.getBoundingClientRect) return false;
-        const rect = el.getBoundingClientRect();
-        if (rect.width < 8 || rect.height < 8 || rect.width > 40 || rect.height > 40) return false;
-        const nearY = rect.bottom >= nr.top - 8 && rect.top <= nr.bottom + 8;
-        const nearX = rect.left >= nr.right - 4 && rect.left <= nr.right + 180;
-        return nearX && nearY;
-      });
-
-      for (const el of nearIconCandidates) {
-        const rect = el.getBoundingClientRect();
-        const attrs = collectAttrs(el);
-        const text = (el.innerText || '').trim();
-        const summary = `${el.tagName.toLowerCase()}|w=${Math.round(rect.width)}|h=${Math.round(rect.height)}|${attrs.join(' | ')}|text=${text}`;
-        iconNodes.push(summary);
-        signalSet.add(summary.toLowerCase());
-        addComputedStyleSignals(el, signalSet, iconStyleSet);
-        if (el.querySelectorAll) {
-          const paths = Array.from(el.querySelectorAll('path')).slice(0, 6);
-          for (const p of paths) {
-            const fill = p.getAttribute('fill');
-            const stroke = p.getAttribute('stroke');
-            if (fill) signalSet.add(`path:fill=${fill}`.toLowerCase());
-            if (stroke) signalSet.add(`path:stroke=${stroke}`.toLowerCase());
-          }
+      const iconSelector = 'img,svg,use,i,span,em';
+      const iconCandidates = Array.from(card.querySelectorAll(iconSelector));
+      for (const node of nodes) {
+        const attrs = collectAttrs(node);
+        const raw = attrs.join(' | ').toLowerCase();
+        const hasKeyword = /(verify|verified|auth|badge|vip|renzheng|认证|gold|orange|yellow|huang|cheng|jin|hong|red|金v|橙v|黄v|\\bv\\b)/.test(raw);
+        if (hasKeyword && raw.length > 0) {
+          signalSet.add(raw);
+          nameRowSignalSet.add(raw);
         }
       }
 
-      // 扫描昵称同层和父层的直接子元素，兼容“昵称文本”和“v图标”为兄弟节点的场景
-      const siblingPools = [];
-      if (nicknameEl.parentElement) siblingPools.push(...Array.from(nicknameEl.parentElement.children));
-      if (nameRow && nameRow.parentElement) siblingPools.push(...Array.from(nameRow.parentElement.children));
-      const dedupSiblings = Array.from(new Set(siblingPools)).filter(Boolean);
-      let siblingIconHit = false;
-      for (const sib of dedupSiblings) {
-        if (sib === nicknameEl || sib === nameRow) continue;
-        if (!sib.getBoundingClientRect) continue;
-        const r = sib.getBoundingClientRect();
-        const nearY = r.bottom >= nr.top - 10 && r.top <= nr.bottom + 10;
-        const nearX = r.left >= nr.right - 6 && r.left <= nr.right + 200;
-        if (!nearX || !nearY) continue;
-        if (r.width < 8 || r.height < 8 || r.width > 48 || r.height > 48) continue;
-        const attrs = collectAttrs(sib);
-        const summary = `${sib.tagName.toLowerCase()}|w=${Math.round(r.width)}|h=${Math.round(r.height)}|${attrs.join(' | ').toLowerCase()}`;
+      const nicknameRight = nameRect.right;
+      const rowTop = rowRect.top;
+      const rowBottom = rowRect.bottom;
+      const nameTop = nameRect.top;
+      const nameBottom = nameRect.bottom;
+      const nearIconCandidates = [];
+      for (const node of iconCandidates) {
+        if (!node || !node.getBoundingClientRect) continue;
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (rect.width > 30 || rect.height > 30) continue;
+
+        const centerY = rect.top + rect.height / 2;
+        const alignedRow = centerY >= (rowTop - 7) && centerY <= (rowBottom + 7);
+        const alignedName = centerY >= (nameTop - 8) && centerY <= (nameBottom + 8);
+        const rightOfName = rect.left >= (nicknameRight - 8);
+        const nearName = rect.left <= (nicknameRight + 140);
+        if (!(alignedRow || alignedName)) continue;
+        if (!(rightOfName && nearName)) continue;
+        if (rect.top < cardRect.top || rect.bottom > cardRect.bottom + 1) continue;
+
+        nearIconCandidates.push(node);
+      }
+
+      for (const node of nearIconCandidates) {
+        const tag = node.tagName.toLowerCase();
+        const rect = node.getBoundingClientRect();
+        const attrs = collectAttrs(node);
+        const raw = attrs.join(' | ').toLowerCase();
+        const st = window.getComputedStyle(node);
+        const summary = `${tag}|w=${Math.round(rect.width)}|h=${Math.round(rect.height)}|${raw}|style_color=${st ? st.color : ''}|style_fill=${st ? st.fill : ''}|style_stroke=${st ? st.stroke : ''}`.trim();
         iconNodes.push(summary);
         signalSet.add(summary);
         nameRowSignalSet.add(summary);
-        addComputedStyleSignals(sib, nameRowSignalSet, iconStyleSet);
-        siblingIconHit = true;
+
+        addComputedStyleSignals(node, nameRowSignalSet, iconStyleSet);
+        if (node.parentElement) addComputedStyleSignals(node.parentElement, nameRowSignalSet, iconStyleSet);
+        if (node.parentElement && node.parentElement.parentElement) {
+          addComputedStyleSignals(node.parentElement.parentElement, nameRowSignalSet, iconStyleSet);
+        }
+
+        if (/(v|vip|verify|badge|认证|gold|orange|yellow|huang|cheng|jin|hong|red)/i.test(summary)) {
+          signalSet.add(summary.toLowerCase());
+          nameRowSignalSet.add(summary.toLowerCase());
+        }
+      }
+
+      // 兜底：昵称文本节点的右侧兄弟节点里，很多站点会把认证图标挂在这里
+      if (nicknameEl && nicknameEl.parentElement) {
+        const siblings = Array.from(nicknameEl.parentElement.children || []);
+        for (const sib of siblings) {
+          if (!sib || sib === nicknameEl || !sib.getBoundingClientRect) continue;
+          const r = sib.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          if (r.left < (nicknameRight - 6) || r.left > (nicknameRight + 160)) continue;
+          const centerY = r.top + r.height / 2;
+          if (centerY < (nameTop - 10) || centerY > (nameBottom + 10)) continue;
+          const attrs = collectAttrs(sib);
+          const summary = `${sib.tagName.toLowerCase()}|w=${Math.round(r.width)}|h=${Math.round(r.height)}|${attrs.join(' | ').toLowerCase()}`;
+          iconNodes.push(summary);
+          signalSet.add(summary);
+          nameRowSignalSet.add(summary);
+          addComputedStyleSignals(sib, nameRowSignalSet, iconStyleSet);
+          siblingIconHit = true;
+        }
       }
 
       // 关键兜底：很多站点把认证图标做成昵称元素的伪元素，而非真实节点
