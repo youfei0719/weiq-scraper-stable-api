@@ -783,6 +783,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
     success_accounts = 0
     failed_accounts = 0
     skipped_accounts = 0
+    terminal_failure_code = ErrorCode.NONE
     global_request_count = 0
 
     print(f"[系统] 本次 run_id={run_id}，任务总数 {total_accounts}。")
@@ -963,6 +964,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                 process_result.error_code = ErrorCode.WRITE_ERROR
                 process_result.error_message = f"{ERROR_MESSAGES_ZH[ErrorCode.WRITE_ERROR]}: {exc}"
                 failed_accounts += 1
+                terminal_failure_code = ErrorCode.WRITE_ERROR
                 processed_accounts += 1
                 emit_event(
                     hooks,
@@ -985,8 +987,11 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                 success_accounts += 1
             elif process_result.account_status == AccountStatus.CANCELLED:
                 failed_accounts += 1
+                terminal_failure_code = ErrorCode.CANCELLED
             else:
                 failed_accounts += 1
+                if process_result.error_code and process_result.error_code != ErrorCode.NONE:
+                    terminal_failure_code = process_result.error_code
 
             emit_event(
                 hooks,
@@ -1006,12 +1011,15 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
         context.storage_state(path=config.state_json)
         browser.close()
 
-    task_status = TaskStatus.SUCCESS
-    error_code = ErrorCode.NONE
-
     if should_stop(hooks):
         task_status = TaskStatus.CANCELLED
         error_code = ErrorCode.CANCELLED
+    elif success_accounts > 0:
+        task_status = TaskStatus.SUCCESS
+        error_code = ErrorCode.NONE
+    else:
+        task_status = TaskStatus.FAILED
+        error_code = terminal_failure_code if terminal_failure_code != ErrorCode.NONE else ErrorCode.EMPTY_PAGE
     finished_at = now_iso()
     emit_event(
         hooks,

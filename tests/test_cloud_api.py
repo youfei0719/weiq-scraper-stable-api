@@ -52,18 +52,10 @@ class TestCloudAPI(unittest.TestCase):
                 )
                 self.assertEqual(create_resp.status_code, 200)
                 task_id = create_resp.json()["task_id"]
-
-                seen_terminal = False
-                for _ in range(20):
-                    task_resp = client.get(f"/v1/tasks/{task_id}")
-                    self.assertEqual(task_resp.status_code, 200)
-                    status = task_resp.json()["status"]
-                    if status in {"FAILED", "SUCCESS", "CANCELLED"}:
-                        seen_terminal = True
-                        break
-                    time.sleep(0.2)
-
-                self.assertTrue(seen_terminal)
+                cloud_api.run_task(task_id)
+                task_resp = client.get(f"/v1/tasks/{task_id}")
+                self.assertEqual(task_resp.status_code, 200)
+                self.assertIn(task_resp.json()["status"], {"FAILED", "SUCCESS", "CANCELLED"})
 
                 cancel_resp = client.post(f"/v1/tasks/{task_id}/cancel")
                 self.assertEqual(cancel_resp.status_code, 200)
@@ -86,6 +78,39 @@ class TestCloudAPI(unittest.TestCase):
                 json={"login_type": "password", "username": "demo", "password": "demo"},
             )
             self.assertEqual(submit_resp.status_code, 409)
+
+    def test_create_auth_session_eager_binds_task_and_returns_waiting_state(self):
+        task = cloud_api.create_task(
+            cloud_api.CreateTaskRequest(
+                accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+            )
+        )
+
+        eager_row = {
+            "session_id": "sess-eager-1",
+            "task_id": task.task_id,
+            "status": "waiting_credentials",
+            "login_url": "https://www.weiq.com/",
+            "qr_image_base64": "preview-1",
+            "message": "请先登录",
+            "expires_at": cloud_api.expiry_iso(),
+        }
+
+        with patch("cloud_api.uuid4") as uuid_mock, patch(
+            "cloud_api._build_eager_auth_session_state",
+            return_value=eager_row,
+        ):
+            uuid_mock.return_value.hex = "sess-eager-1"
+            with TestClient(cloud_api.app) as client:
+                resp = client.post("/v1/auth/session", json={"task_id": task.task_id, "eager": True})
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["session_id"], "sess-eager-1")
+        self.assertEqual(body["status"], "waiting_credentials")
+        task_row = cloud_api.fetch_one("SELECT login_session_id FROM tasks WHERE task_id = ?", (task.task_id,))
+        assert task_row is not None
+        self.assertEqual(task_row["login_session_id"], "sess-eager-1")
 
     def test_inspect_active_auth_session_requires_usable_storage_state(self):
         class _Locator:
@@ -133,6 +158,32 @@ class TestCloudAPI(unittest.TestCase):
         assert row is not None
         self.assertEqual(row["status"], "waiting_credentials")
         self.assertIn("尚未检测到有效的 WEIQ 登录态", row["message"])
+
+    def test_build_status_payload_exposes_queue_and_login_state(self):
+        cloud_api.upsert_auth_session(
+            "sess-meta-1",
+            {
+                "status": "waiting_credentials",
+                "login_url": "https://www.weiq.com/",
+                "message": "等待登录",
+                "expires_at": cloud_api.expiry_iso(),
+            },
+        )
+        payload = cloud_api.build_status_payload(
+            {
+                "task_id": "task-meta-1",
+                "status": cloud_api.TaskStatus.PENDING,
+                "error_code": cloud_api.ErrorCode.NONE,
+                "message": "任务已受理，等待执行器接单",
+                "login_session_id": "sess-meta-1",
+                "accepted_at": cloud_api.now_iso(),
+            }
+        )
+
+        self.assertEqual(payload["auth_session_status"], "waiting_credentials")
+        self.assertTrue(payload["needs_login"])
+        self.assertIn("worker_alive", payload)
+        self.assertIn("queue_size", payload)
 
     def test_build_status_payload_prefers_runtime_message_while_running(self):
         payload = cloud_api.build_status_payload(

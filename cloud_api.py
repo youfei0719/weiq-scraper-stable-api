@@ -25,9 +25,11 @@ from scraper_runtime import (
     detect_auth_or_challenge,
     extract_metrics,
     has_usable_storage_state,
+    init_browser,
     infer_post_extraction_issue,
     run_crawl,
 )
+from playwright.sync_api import sync_playwright
 
 DB_PATH = Path("weiq_local.db").resolve()
 TASK_QUEUE: "queue.Queue[str]" = queue.Queue()
@@ -106,6 +108,11 @@ class AuthSessionResponse(BaseModel):
     available_login_types: list[str] = Field(default_factory=lambda: ["password", "phone_code"])
 
 
+class AuthSessionCreateRequest(BaseModel):
+    task_id: str | None = None
+    eager: bool = Field(default=False)
+
+
 class AuthAttachTaskRequest(BaseModel):
     task_id: str
 
@@ -137,6 +144,16 @@ def now_iso() -> str:
 
 def expiry_iso(minutes: int = 10) -> str:
     return (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def get_runtime_dir() -> Path:
@@ -194,6 +211,8 @@ def init_db() -> None:
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     resume_requested INTEGER NOT NULL DEFAULT 0,
                     login_session_id TEXT,
+                    accepted_at TEXT,
+                    picked_up_at TEXT,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT
@@ -218,6 +237,10 @@ def init_db() -> None:
             task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
             if "login_session_id" not in task_cols:
                 conn.execute("ALTER TABLE tasks ADD COLUMN login_session_id TEXT")
+            if "accepted_at" not in task_cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN accepted_at TEXT")
+            if "picked_up_at" not in task_cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN picked_up_at TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_tasks_login_session_id ON tasks(login_session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_task_id ON auth_sessions(task_id)")
             conn.commit()
@@ -379,6 +402,11 @@ def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
     status = row.get("status", TaskStatus.PENDING)
     error_code = row.get("error_code") or ErrorCode.NONE
     message = row.get("message") or None
+    auth_session_status = None
+    login_session_id = str(row.get("login_session_id") or "").strip()
+    if login_session_id:
+        auth_session = fetch_auth_session(login_session_id)
+        auth_session_status = str(auth_session.get("status") or "").strip() if auth_session else None
     export_file = None
     output_excel = str(row.get("output_excel") or "").strip()
     output_dir = str(row.get("output_dir") or "").strip()
@@ -391,12 +419,36 @@ def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
         error_message_zh = message
     else:
         error_message_zh = ERROR_MESSAGES_ZH.get(error_code, message or error_code)
+    accepted_at = str(row.get("accepted_at") or row.get("created_at") or "").strip() or None
+    picked_up_at = str(row.get("picked_up_at") or row.get("started_at") or "").strip() or None
+    queue_age_seconds = None
+    accepted_dt = parse_iso(accepted_at)
+    picked_up_dt = parse_iso(picked_up_at)
+    if accepted_dt is not None:
+        if status == TaskStatus.PENDING and picked_up_dt is None:
+            queue_age_seconds = max(0, int((datetime.now() - accepted_dt).total_seconds()))
+        elif picked_up_dt is not None:
+            queue_age_seconds = max(0, int((picked_up_dt - accepted_dt).total_seconds()))
+    with QUEUE_LOCK:
+        queue_size = TASK_QUEUE.qsize()
+    worker_alive = bool(WORKER_THREAD and WORKER_THREAD.is_alive())
+    needs_login = bool(
+        status == TaskStatus.BLOCKED_AUTH
+        or auth_session_status in {"pending", "waiting_credentials", "waiting_code", "logging_in"}
+    )
     return {
         **row,
         "status_zh": STATUS_ZH.get(status, status),
         "error_message_zh": error_message_zh,
         "auth_waiting": status == TaskStatus.BLOCKED_AUTH,
         "export_file": export_file,
+        "accepted_at": accepted_at,
+        "picked_up_at": picked_up_at,
+        "queue_age_seconds": queue_age_seconds,
+        "worker_alive": worker_alive,
+        "queue_size": queue_size,
+        "auth_session_status": auth_session_status,
+        "needs_login": needs_login,
     }
 
 
@@ -429,6 +481,20 @@ def build_auth_session_response(row: dict[str, Any]) -> AuthSessionResponse:
     )
 
 
+def _close_active_session_runtime(session: dict[str, Any] | None) -> None:
+    if not session:
+        return
+    for resource in (session.get("browser"), session.get("playwright")):
+        if resource is None:
+            continue
+        try:
+            close_fn = getattr(resource, "close", None) or getattr(resource, "stop", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+
+
 def infer_auth_session_state(page, reason_code: str) -> tuple[str, str]:
     page_text = ""
     try:
@@ -445,6 +511,62 @@ def infer_auth_session_state(page, reason_code: str) -> tuple[str, str]:
     if reason_code == ErrorCode.CAPTCHA_REQUIRED:
         return "waiting_code", ERROR_MESSAGES_ZH.get(reason_code, "等待验证处理")
     return "waiting_credentials", ERROR_MESSAGES_ZH.get(reason_code, "等待登录处理")
+
+
+def _build_eager_auth_session_state(
+    *,
+    session_id: str,
+    task_id: str | None,
+    state_json: str,
+    headless: bool,
+    login_url: str = "https://www.weiq.com/",
+) -> dict[str, Any]:
+    playwright_ctx = sync_playwright().start()
+    browser, context, page = init_browser(playwright_ctx, state_json, headless)
+    try:
+        page.goto(login_url, timeout=45000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+
+    is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_json)
+    if is_authenticated:
+        try:
+            context.storage_state(path=state_json)
+        except Exception:
+            pass
+        row = {
+            "task_id": task_id,
+            "status": "authenticated",
+            "login_url": page.url or login_url,
+            "qr_image_base64": None,
+            "message": "已检测到可用的 WEIQ 登录态，任务可直接继续。",
+            "expires_at": expiry_iso(30),
+        }
+        upsert_auth_session(session_id, row)
+        _close_active_session_runtime({"browser": browser, "playwright": playwright_ctx})
+        return fetch_auth_session(session_id) or row
+
+    status_text, message = infer_auth_session_state(page, reason_code)
+    row = {
+        "task_id": task_id,
+        "status": status_text,
+        "login_url": page.url or login_url,
+        "qr_image_base64": capture_login_screen_base64(page),
+        "message": pending_message or message,
+        "expires_at": expiry_iso(),
+    }
+    upsert_auth_session(session_id, row)
+    register_active_session(
+        session_id,
+        task_id=task_id or "",
+        page=page,
+        context=context,
+        state_json=state_json,
+        login_url=page.url or login_url,
+        browser=browser,
+        playwright=playwright_ctx,
+    )
+    return fetch_auth_session(session_id) or row
 
 
 def iter_login_targets(page) -> list[Any]:
@@ -712,17 +834,25 @@ def register_active_session(
     context,
     state_json: str,
     login_url: str,
+    browser=None,
+    playwright=None,
 ) -> None:
     with ACTIVE_AUTH_LOCK:
+        previous = ACTIVE_AUTH_SESSIONS.get(session_id)
         ACTIVE_AUTH_SESSIONS[session_id] = {
             "task_id": task_id,
             "page": page,
             "context": context,
             "state_json": state_json,
             "login_url": login_url,
+            "browser": browser,
+            "playwright": playwright,
             "lock": threading.RLock(),
         }
-        TASK_TO_SESSION[task_id] = session_id
+        if task_id:
+            TASK_TO_SESSION[task_id] = session_id
+    if previous is not None and previous.get("page") is not page:
+        _close_active_session_runtime(previous)
 
 
 def unregister_active_session(session_id: str) -> None:
@@ -730,6 +860,7 @@ def unregister_active_session(session_id: str) -> None:
         session = ACTIVE_AUTH_SESSIONS.pop(session_id, None)
         if session:
             TASK_TO_SESSION.pop(str(session.get("task_id") or ""), None)
+    _close_active_session_runtime(session)
 
 
 def migrate_active_session(old_session_id: str, new_session_id: str, task_id: str) -> None:
@@ -979,6 +1110,7 @@ def run_task(task_id: str) -> None:
         {
             "status": TaskStatus.RUNNING,
             "started_at": now_iso(),
+            "picked_up_at": now_iso(),
             "message": "WEIQ 执行器已接单，开始抓取",
         },
     )
@@ -999,7 +1131,13 @@ def run_task(task_id: str) -> None:
                 "output_excel": result.output_excel,
                 "error_code": result.error_code,
                 "finished_at": result.finished_at,
-                "message": "任务已完成" if result.status == TaskStatus.SUCCESS else "任务已结束",
+                "message": (
+                    "任务已完成"
+                    if result.status == TaskStatus.SUCCESS
+                    else "任务执行失败"
+                    if result.status == TaskStatus.FAILED
+                    else "任务已结束"
+                ),
             },
         )
     except Exception as exc:
@@ -1120,14 +1258,14 @@ def create_task(payload: CreateTaskRequest) -> TaskControlResponse:
             task_id, status, progress, current_account, blocked_reason, error_code, message,
             input_excel, output_excel, output_dir, state_json, state_storage,
             headless, cooldown_every, cooldown_seconds, retry_times, retry_backoff_seconds, resume,
-            login_session_id, created_at
-        ) VALUES (?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            login_session_id, accepted_at, picked_up_at, created_at
+        ) VALUES (?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?)
         """,
         (
             task_id,
             TaskStatus.PENDING,
             ErrorCode.NONE,
-            "任务已创建，等待执行",
+            "任务已受理，等待执行器接单",
             materialized["input_excel"],
             materialized["output_excel"],
             materialized["output_dir"],
@@ -1140,11 +1278,12 @@ def create_task(payload: CreateTaskRequest) -> TaskControlResponse:
             materialized["retry_backoff_seconds"],
             int(bool(materialized["resume"])),
             created_at,
+            created_at,
         ),
     )
 
     enqueue_task(task_id)
-    return TaskControlResponse(task_id=task_id, status=TaskStatus.PENDING, message="任务已创建")
+    return TaskControlResponse(task_id=task_id, status=TaskStatus.PENDING, message="任务已受理")
 
 
 @app.get("/v1/tasks/{task_id}")
@@ -1211,19 +1350,39 @@ def requeue_task(task_id: str) -> TaskControlResponse:
 
 
 @app.post("/v1/auth/session", response_model=AuthSessionResponse)
-def create_auth_session() -> AuthSessionResponse:
+def create_auth_session(payload: AuthSessionCreateRequest | None = None) -> AuthSessionResponse:
+    payload = payload or AuthSessionCreateRequest()
     session_id = uuid4().hex
+    state_json = str((get_runtime_dir() / "state.json").resolve())
+    headless = True
+    task_id = payload.task_id
+    if task_id:
+        task = fetch_one("SELECT task_id, state_json, headless FROM tasks WHERE task_id = ?", (task_id,))
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        state_json = str(task.get("state_json") or state_json)
+        headless = bool(task.get("headless"))
     upsert_auth_session(
         session_id,
         {
-            "task_id": None,
+            "task_id": task_id,
             "status": "pending",
             "login_url": "https://www.weiq.com/",
             "qr_image_base64": None,
-            "message": "登录会话已创建，等待绑定抓取任务",
+            "message": "登录会话已创建，等待绑定抓取任务" if not payload.eager else "登录会话已创建，正在准备 WEIQ 登录页",
             "expires_at": expiry_iso(),
         },
     )
+    if task_id:
+        upsert_task_event(task_id, {"login_session_id": session_id})
+    if payload.eager:
+        row = _build_eager_auth_session_state(
+            session_id=session_id,
+            task_id=task_id,
+            state_json=state_json,
+            headless=headless,
+        )
+        return build_auth_session_response(row)
     row = fetch_auth_session(session_id)
     assert row is not None
     return build_auth_session_response(row)
@@ -1239,7 +1398,7 @@ def get_auth_session(session_id: str) -> AuthSessionResponse:
 
 @app.post("/v1/auth/session/{session_id}/attach-task", response_model=AuthSessionResponse)
 def attach_auth_session_to_task(session_id: str, payload: AuthAttachTaskRequest) -> AuthSessionResponse:
-    task = fetch_one("SELECT task_id, login_session_id, status FROM tasks WHERE task_id = ?", (payload.task_id,))
+    task = fetch_one("SELECT task_id, login_session_id, status, state_json, headless FROM tasks WHERE task_id = ?", (payload.task_id,))
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -1276,6 +1435,15 @@ def attach_auth_session_to_task(session_id: str, payload: AuthAttachTaskRequest)
 
     upsert_task_event(payload.task_id, {"login_session_id": session_id})
     upsert_auth_session(session_id, {"task_id": payload.task_id, "message": "登录会话已绑定任务"})
+    if session_id not in ACTIVE_AUTH_SESSIONS:
+        session_row = fetch_auth_session(session_id)
+        if session_row and str(session_row.get("status") or "") in {"pending", "waiting_credentials", "waiting_code", "logging_in"}:
+            _build_eager_auth_session_state(
+                session_id=session_id,
+                task_id=payload.task_id,
+                state_json=str(task.get("state_json") or (get_runtime_dir() / "state.json")),
+                headless=bool(task.get("headless")),
+            )
     return get_auth_session(session_id)
 
 
