@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -84,6 +86,53 @@ class TestCloudAPI(unittest.TestCase):
                 json={"login_type": "password", "username": "demo", "password": "demo"},
             )
             self.assertEqual(submit_resp.status_code, 409)
+
+    def test_inspect_active_auth_session_requires_usable_storage_state(self):
+        class _Locator:
+            def inner_text(self, timeout: int = 1500) -> str:  # noqa: ARG002
+                return "欢迎来到 WEIQ"
+
+        class _Page:
+            url = "https://www.weiq.com/"
+
+            def locator(self, selector: str) -> _Locator:  # noqa: ARG002
+                return _Locator()
+
+        class _Context:
+            def storage_state(self, path: str) -> None:
+                Path(path).write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
+            session_id = "session-auth-check"
+            cloud_api.upsert_auth_session(
+                session_id,
+                {
+                    "status": "waiting_credentials",
+                    "login_url": "https://www.weiq.com/",
+                    "message": "等待登录",
+                    "expires_at": cloud_api.expiry_iso(),
+                },
+            )
+            cloud_api.register_active_session(
+                session_id,
+                task_id="task-auth-check",
+                page=_Page(),
+                context=_Context(),
+                state_json=str(state_path),
+                login_url="https://www.weiq.com/",
+            )
+
+            try:
+                with patch("cloud_api.infer_runtime_auth_requirement", return_value=(False, cloud_api.ErrorCode.NONE)):
+                    row = cloud_api.inspect_active_auth_session(session_id)
+            finally:
+                cloud_api.unregister_active_session(session_id)
+
+        assert row is not None
+        self.assertEqual(row["status"], "waiting_credentials")
+        self.assertIn("尚未检测到有效的 WEIQ 登录态", row["message"])
 
     def test_build_status_payload_prefers_runtime_message_while_running(self):
         payload = cloud_api.build_status_payload(

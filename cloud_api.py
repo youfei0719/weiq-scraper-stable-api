@@ -24,6 +24,7 @@ from scraper_runtime import (
     TaskStatus,
     detect_auth_or_challenge,
     extract_metrics,
+    has_usable_storage_state,
     infer_post_extraction_issue,
     run_crawl,
 )
@@ -574,6 +575,15 @@ def infer_runtime_auth_requirement(page) -> tuple[bool, str]:
     return False, ErrorCode.NONE
 
 
+def resolve_auth_completion(page, state_json: str) -> tuple[bool, str, str | None]:
+    needs_auth, reason_code = infer_runtime_auth_requirement(page)
+    if needs_auth:
+        return False, reason_code, None
+    if not has_usable_storage_state(state_json):
+        return False, ErrorCode.AUTH_REQUIRED, "尚未检测到有效的 WEIQ 登录态，请先完成登录后再继续抓取。"
+    return True, ErrorCode.NONE, None
+
+
 def sanitize_account_text(value: str | None) -> str:
     return re.sub(r"\s+", "", str(value or "")).strip()
 
@@ -645,8 +655,8 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             raise HTTPException(status_code=422, detail="未找到登录提交按钮，请检查当前 WEIQ 登录页")
         wait_for_page_settle(page)
 
-        needs_auth, reason_code = infer_runtime_auth_requirement(page)
-        if not needs_auth:
+        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_json)
+        if is_authenticated:
             try:
                 context.storage_state(path=state_json)
             except Exception:
@@ -679,7 +689,7 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             "status": status_text,
             "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
             "qr_image_base64": capture_login_screen_base64(page),
-            "message": message,
+            "message": pending_message or message,
             "expires_at": expiry_iso(),
         }
         upsert_auth_session(session_id, row)
@@ -688,7 +698,7 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             {
                 "status": TaskStatus.BLOCKED_AUTH,
                 "blocked_reason": reason_code,
-                "message": message,
+                "message": pending_message or message,
             },
         )
         return fetch_auth_session(session_id) or row
@@ -772,8 +782,8 @@ def inspect_active_auth_session(session_id: str) -> Optional[dict[str, Any]]:
     context = session["context"]
     state_json = session["state_json"]
     with session["lock"]:
-        needs_auth, reason_code = infer_runtime_auth_requirement(page)
-        if not needs_auth:
+        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_json)
+        if is_authenticated:
             try:
                 context.storage_state(path=state_json)
             except Exception:
@@ -805,7 +815,7 @@ def inspect_active_auth_session(session_id: str) -> Optional[dict[str, Any]]:
                     "status": status_text,
                     "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
                     "qr_image_base64": capture_login_screen_base64(page),
-                    "message": message,
+                    "message": pending_message or message,
                     "expires_at": expiry_iso(),
                 },
             )
@@ -831,22 +841,41 @@ def wait_for_auth_or_cancel(task_id: str, session_id: str, page, context, state_
             return True
 
         if row["resume_requested"]:
-            try:
-                context.storage_state(path=state_json)
-            except Exception:
-                pass
+            if has_usable_storage_state(state_json):
+                try:
+                    context.storage_state(path=state_json)
+                except Exception:
+                    pass
+                upsert_task_event(
+                    task_id,
+                    {
+                        "resume_requested": 0,
+                        "status": TaskStatus.RUNNING,
+                        "blocked_reason": None,
+                        "message": "已收到继续请求，恢复运行",
+                    },
+                )
+                upsert_auth_session(session_id, {"status": "authenticated", "message": "已手动请求继续"})
+                unregister_active_session(session_id)
+                return True
+
             upsert_task_event(
                 task_id,
                 {
                     "resume_requested": 0,
-                    "status": TaskStatus.RUNNING,
-                    "blocked_reason": None,
-                    "message": "已收到继续请求，恢复运行",
+                    "status": TaskStatus.BLOCKED_AUTH,
+                    "blocked_reason": ErrorCode.AUTH_REQUIRED,
+                    "message": "尚未检测到有效的 WEIQ 登录态，请先完成登录后再继续。",
                 },
             )
-            upsert_auth_session(session_id, {"status": "authenticated", "message": "已手动请求继续"})
-            unregister_active_session(session_id)
-            return True
+            upsert_auth_session(
+                session_id,
+                {
+                    "status": "waiting_credentials",
+                    "message": "尚未检测到有效的 WEIQ 登录态，请先完成登录后再继续。",
+                    "expires_at": expiry_iso(),
+                },
+            )
         time.sleep(1)
 
 
