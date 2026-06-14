@@ -39,6 +39,7 @@ ACTIVE_AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 TASK_TO_SESSION: dict[str, str] = {}
 QUEUE_LOCK = threading.Lock()
 QUEUED_TASK_IDS: set[str] = set()
+ACTIVE_TASK_IDS: set[str] = set()
 WORKER_THREAD: threading.Thread | None = None
 WORKER_STARTED_AT: str | None = None
 LAST_WORKER_ERROR: str | None = None
@@ -282,7 +283,7 @@ def fetch_value(sql: str, params: tuple[Any, ...] = ()) -> int:
 
 def enqueue_task(task_id: str) -> bool:
     with QUEUE_LOCK:
-        if task_id in QUEUED_TASK_IDS:
+        if task_id in QUEUED_TASK_IDS or task_id in ACTIVE_TASK_IDS:
             return False
         QUEUED_TASK_IDS.add(task_id)
         TASK_QUEUE.put(task_id)
@@ -732,7 +733,7 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             if not phone:
                 raise HTTPException(status_code=400, detail="手机号不能为空")
             if not fill_first_visible(targets, USERNAME_SELECTORS, phone):
-                raise HTTPException(status_code=422, detail="未找到手机号输入框，请检查当前 WEIQ 登录页")
+                raise HTTPException(status_code=422, detail="当前 WEIQ 登录页未切换到手机号验证码模式，请改用账号密码登录，或先切换到手机验证码登录后重试")
             if action == "send_code":
                 if not click_first_text(targets, SEND_CODE_TEXTS):
                     raise HTTPException(status_code=422, detail="未找到发送验证码按钮，请检查当前 WEIQ 登录页")
@@ -1158,22 +1159,35 @@ def worker_loop() -> None:
         task_id = TASK_QUEUE.get()
         with QUEUE_LOCK:
             QUEUED_TASK_IDS.discard(task_id)
-        try:
-            run_task(task_id)
-            LAST_WORKER_ERROR = None
-        except Exception as exc:
-            LAST_WORKER_ERROR = f"{now_iso()} {exc}"
-            upsert_task_event(
-                task_id,
-                {
-                    "status": TaskStatus.FAILED,
-                    "finished_at": now_iso(),
-                    "error_code": "INTERNAL_ERROR",
-                    "message": f"Worker 异常退出: {exc}",
-                },
-            )
-        finally:
-            TASK_QUEUE.task_done()
+            ACTIVE_TASK_IDS.add(task_id)
+        threading.Thread(
+            target=_run_task_in_background,
+            args=(task_id,),
+            daemon=True,
+            name=f"weiq-task-{task_id[:8]}",
+        ).start()
+        TASK_QUEUE.task_done()
+
+
+def _run_task_in_background(task_id: str) -> None:
+    global LAST_WORKER_ERROR
+    try:
+        run_task(task_id)
+        LAST_WORKER_ERROR = None
+    except Exception as exc:
+        LAST_WORKER_ERROR = f"{now_iso()} {exc}"
+        upsert_task_event(
+            task_id,
+            {
+                "status": TaskStatus.FAILED,
+                "finished_at": now_iso(),
+                "error_code": "INTERNAL_ERROR",
+                "message": f"Worker 异常退出: {exc}",
+            },
+        )
+    finally:
+        with QUEUE_LOCK:
+            ACTIVE_TASK_IDS.discard(task_id)
 
 
 def start_worker() -> None:

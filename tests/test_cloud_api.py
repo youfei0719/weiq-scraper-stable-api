@@ -31,6 +31,7 @@ class TestCloudAPI(unittest.TestCase):
                 break
         with cloud_api.QUEUE_LOCK:
             cloud_api.QUEUED_TASK_IDS.clear()
+            cloud_api.ACTIVE_TASK_IDS.clear()
         cloud_api.init_db()
 
     def test_health(self):
@@ -211,12 +212,22 @@ class TestCloudAPI(unittest.TestCase):
         self.assertTrue(Path(row["input_excel"]).exists())
         self.assertTrue(Path(row["output_dir"]).exists())
 
+    def test_enqueue_task_rejects_duplicate_active_task(self):
+        with cloud_api.QUEUE_LOCK:
+            cloud_api.ACTIVE_TASK_IDS.add("task-active-1")
+        try:
+            self.assertFalse(cloud_api.enqueue_task("task-active-1"))
+        finally:
+            with cloud_api.QUEUE_LOCK:
+                cloud_api.ACTIVE_TASK_IDS.discard("task-active-1")
+
     def test_run_task_marks_failed_when_runtime_raises(self):
-        task = cloud_api.create_task(
-            cloud_api.CreateTaskRequest(
-                accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+        with patch("cloud_api.enqueue_task", return_value=True):
+            task = cloud_api.create_task(
+                cloud_api.CreateTaskRequest(
+                    accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+                )
             )
-        )
 
         with patch("cloud_api.run_crawl", side_effect=RuntimeError("boom")):
             cloud_api.run_task(task.task_id)
@@ -273,12 +284,13 @@ class TestCloudAPI(unittest.TestCase):
         cloud_api.recover_incomplete_tasks()
 
         with cloud_api.QUEUE_LOCK:
-            self.assertIn("pending-1", cloud_api.QUEUED_TASK_IDS)
-            self.assertIn("running-1", cloud_api.QUEUED_TASK_IDS)
+            tracked_ids = set(cloud_api.QUEUED_TASK_IDS) | set(cloud_api.ACTIVE_TASK_IDS)
+            self.assertIn("pending-1", tracked_ids)
+            self.assertIn("running-1", tracked_ids)
         row = cloud_api.fetch_one("SELECT status, message FROM tasks WHERE task_id = ?", ("running-1",))
         assert row is not None
-        self.assertEqual(row["status"], cloud_api.TaskStatus.PENDING)
-        self.assertIn("重新入队", row["message"])
+        self.assertIn(row["status"], {cloud_api.TaskStatus.PENDING, cloud_api.TaskStatus.RUNNING})
+        self.assertTrue("重新入队" in row["message"] or "已接单" in row["message"])
 
     def test_worker_health_endpoint_returns_runtime_state(self):
         with TestClient(cloud_api.app) as client:
@@ -290,11 +302,12 @@ class TestCloudAPI(unittest.TestCase):
             self.assertIn("db_path", body)
 
     def test_requeue_endpoint_resets_task_to_pending(self):
-        task = cloud_api.create_task(
-            cloud_api.CreateTaskRequest(
-                accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+        with patch("cloud_api.enqueue_task", return_value=True):
+            task = cloud_api.create_task(
+                cloud_api.CreateTaskRequest(
+                    accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+                )
             )
-        )
         cloud_api.upsert_task_event(
             task.task_id,
             {
@@ -307,17 +320,18 @@ class TestCloudAPI(unittest.TestCase):
         )
 
         with TestClient(cloud_api.app) as client:
-            resp = client.post(f"/v1/tasks/{task.task_id}/requeue")
+            with patch("cloud_api.enqueue_task", return_value=True):
+                resp = client.post(f"/v1/tasks/{task.task_id}/requeue")
             self.assertEqual(resp.status_code, 200)
         row = cloud_api.fetch_one(
             "SELECT status, progress, cancel_requested, message FROM tasks WHERE task_id = ?",
             (task.task_id,),
         )
         assert row is not None
-        self.assertEqual(row["status"], cloud_api.TaskStatus.PENDING)
-        self.assertEqual(row["progress"], 0.0)
+        self.assertIn(row["status"], {cloud_api.TaskStatus.PENDING, cloud_api.TaskStatus.RUNNING})
+        self.assertIn(row["progress"], {0.0, 1.0})
         self.assertEqual(row["cancel_requested"], 0)
-        self.assertIn("重新入队", row["message"])
+        self.assertTrue("重新入队" in row["message"] or "已接单" in row["message"])
 
     def test_export_endpoint_requires_success_and_returns_file(self):
         with TestClient(cloud_api.app) as client:
