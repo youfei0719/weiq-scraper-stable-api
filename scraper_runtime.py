@@ -484,6 +484,24 @@ def detect_auth_or_challenge(page) -> tuple[bool, str]:
     return False, ErrorCode.NONE
 
 
+def infer_blocked_response_issue(page) -> str:
+    needs_auth, reason_code = detect_auth_or_challenge(page)
+    if needs_auth:
+        return reason_code
+
+    page_text = _safe_body_text(page)
+    has_login_form = _page_has_visible_login_form(page)
+    inferred = infer_post_extraction_issue(
+        page_url=page.url,
+        page_text=page_text,
+        has_login_form=has_login_form,
+        extracted_data={key: "空" for key in METRIC_KEYS},
+    )
+    if inferred in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+        return inferred
+    return ErrorCode.HTTP_BLOCKED
+
+
 def perform_lazy_scroll(page) -> None:
     page.evaluate(
         """
@@ -535,6 +553,30 @@ def process_account_url(
             if response is None or response.status >= 400:
                 msg = f"状态码异常: {response.status if response else 'Null'}"
                 print(f"{progress} ❌ {msg}")
+                issue_code = infer_blocked_response_issue(page)
+                if issue_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+                    auth_handler = hooks.on_auth_required or default_auth_handler
+                    emit_event(
+                        hooks,
+                        {
+                            "type": "auth_required",
+                            "reason_code": issue_code,
+                            "page_url": page.url,
+                            "current_index": current_idx,
+                            "total_accounts": total_accounts,
+                        },
+                    )
+                    if auth_handler(issue_code, page.url, page, context, config.state_json):
+                        if attempt < config.retry_times:
+                            print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
+                            time.sleep(config.retry_backoff_seconds)
+                            continue
+                    return AccountProcessResult(
+                        metrics={k: "等待登录" for k in METRIC_KEYS},
+                        account_status=AccountStatus.FAILED,
+                        error_code=issue_code,
+                        error_message=ERROR_MESSAGES_ZH[issue_code],
+                    )
                 return AccountProcessResult(
                     metrics={k: "异常_阻断" for k in METRIC_KEYS},
                     account_status=AccountStatus.FAILED,

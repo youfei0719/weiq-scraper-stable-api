@@ -5,11 +5,36 @@ from scraper_runtime import (
     ErrorCode,
     METRIC_KEYS,
     _count_effective_metrics,
+    infer_blocked_response_issue,
     infer_post_extraction_issue,
 )
 
 
 class RuntimeQualityTest(unittest.TestCase):
+    def test_blocked_response_with_login_hints_is_treated_as_auth_required(self) -> None:
+        class _LocatorItem:
+            def is_visible(self) -> bool:
+                return True
+
+        class _Locator:
+            def count(self) -> int:
+                return 1
+
+            def nth(self, index: int) -> _LocatorItem:  # noqa: ARG002
+                return _LocatorItem()
+
+            def inner_text(self, timeout: int = 2000) -> str:  # noqa: ARG002
+                return "请先登录后查看完整数据，支持账号密码登录"
+
+        class _Page:
+            url = "https://www.weiq.com/login"
+
+            def locator(self, selector: str) -> _Locator:  # noqa: ARG002
+                return _Locator()
+
+        issue = infer_blocked_response_issue(_Page())
+        self.assertEqual(issue, ErrorCode.AUTH_REQUIRED)
+
     def test_effective_metric_count_supports_w_suffix(self) -> None:
         extracted = {key: "空_无标签" for key in METRIC_KEYS}
         extracted["粉丝数"] = "126w"
