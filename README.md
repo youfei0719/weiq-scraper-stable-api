@@ -175,7 +175,11 @@ python scraper.py --probe-verify --probe-uids 2115314532,6557986019
 ### 6.1 启动 API 服务
 
 ```bash
-python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080
+python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080 --workers 1
+
+说明：
+- 当前云端 API 依赖进程内任务队列，只支持单 worker 进程模式。
+- 如果后续需要多 worker/多实例，请改为 Redis、Celery、RQ 等外部队列方案。
 ```
 
 健康检查：

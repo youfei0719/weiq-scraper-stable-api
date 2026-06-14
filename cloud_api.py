@@ -1,4 +1,5 @@
 import base64
+import os
 import queue
 import re
 import sqlite3
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from analytics import incremental_changes, load_result_df, quality_report
@@ -32,6 +34,11 @@ DB_LOCK = threading.Lock()
 ACTIVE_AUTH_LOCK = threading.Lock()
 ACTIVE_AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 TASK_TO_SESSION: dict[str, str] = {}
+QUEUE_LOCK = threading.Lock()
+QUEUED_TASK_IDS: set[str] = set()
+WORKER_THREAD: threading.Thread | None = None
+WORKER_STARTED_AT: str | None = None
+LAST_WORKER_ERROR: str | None = None
 
 STATUS_ZH = {
     TaskStatus.PENDING: "排队中",
@@ -57,13 +64,20 @@ ERROR_MESSAGES_ZH = {
 app = FastAPI(title="WEIQ Scraper API", version="0.2.0")
 
 
+class AccountInput(BaseModel):
+    nickname: str | None = None
+    uid: str
+    account_id: str | None = None
+
+
 class CreateTaskRequest(BaseModel):
-    input_excel: str = Field(default="accounts.xlsx")
-    output_excel: str = Field(default="weiq_results.xlsx")
-    output_dir: str = Field(default=".")
-    state_json: str = Field(default="state.json")
-    state_storage: str = Field(default="crawl_state.json")
-    headless: bool = Field(default=False)
+    accounts: list[AccountInput] | None = None
+    input_excel: str | None = Field(default=None)
+    output_excel: str | None = Field(default=None)
+    output_dir: str | None = Field(default=None)
+    state_json: str | None = Field(default=None)
+    state_storage: str | None = Field(default=None)
+    headless: bool = Field(default=True)
     cooldown_every: int = Field(default=50)
     cooldown_seconds: int = Field(default=180)
     retry_times: int = Field(default=1)
@@ -104,12 +118,39 @@ class AuthSubmitRequest(BaseModel):
     verification_code: str | None = None
 
 
+class WorkerHealthResponse(BaseModel):
+    worker_alive: bool
+    worker_started_at: str | None = None
+    queue_size: int
+    queued_task_ids: list[str]
+    pending_count: int
+    running_count: int
+    last_worker_error: str | None = None
+    process_id: int
+    db_path: str
+
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
 def expiry_iso(minutes: int = 10) -> str:
     return (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+def get_runtime_dir() -> Path:
+    runtime_dir = Path(os.getenv("WEIQ_API_RUNTIME_DIR", "./runtime")).expanduser()
+    if not runtime_dir.is_absolute():
+        runtime_dir = (Path.cwd() / runtime_dir).resolve()
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
+def ensure_single_worker_mode() -> None:
+    for env_name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw = os.getenv(env_name, "").strip()
+        if raw.isdigit() and int(raw) > 1:
+            raise RuntimeError("当前 WEIQ API 仅支持单 worker 进程模式启动，请使用 --workers 1")
 
 
 def get_conn() -> sqlite3.Connection:
@@ -203,6 +244,27 @@ def fetch_one(sql: str, params: tuple[Any, ...] = ()) -> Optional[dict[str, Any]
             conn.close()
 
 
+def fetch_value(sql: str, params: tuple[Any, ...] = ()) -> int:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            row = conn.execute(sql, params).fetchone()
+            if row is None:
+                return 0
+            return int(row[0] or 0)
+        finally:
+            conn.close()
+
+
+def enqueue_task(task_id: str) -> bool:
+    with QUEUE_LOCK:
+        if task_id in QUEUED_TASK_IDS:
+            return False
+        QUEUED_TASK_IDS.add(task_id)
+        TASK_QUEUE.put(task_id)
+        return True
+
+
 def upsert_task_event(task_id: str, updates: dict[str, Any]) -> None:
     if not updates:
         return
@@ -254,10 +316,76 @@ def fetch_auth_session(session_id: str) -> Optional[dict[str, Any]]:
     return fetch_one("SELECT * FROM auth_sessions WHERE session_id = ?", (session_id,))
 
 
+def materialize_task_request(payload: CreateTaskRequest) -> dict[str, Any]:
+    runtime_dir = get_runtime_dir()
+    task_key = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+
+    if payload.accounts:
+        accounts = []
+        for item in payload.accounts:
+            uid = str(item.uid or "").strip()
+            if not uid:
+                continue
+            account_id = str(item.account_id or item.nickname or uid).strip() or uid
+            accounts.append({"账号ID": account_id, "uid": uid})
+        if not accounts:
+            raise HTTPException(status_code=400, detail="accounts 不能为空，且每个账号必须带 uid")
+
+        input_dir = runtime_dir / "inputs"
+        output_dir = runtime_dir / "outputs" / task_key
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        input_excel = input_dir / f"accounts_{task_key}.xlsx"
+        pd.DataFrame(accounts).to_excel(input_excel, index=False)
+        return {
+            "input_excel": str(input_excel.resolve()),
+            "output_excel": f"weiq_results_{task_key}.xlsx",
+            "output_dir": str(output_dir.resolve()),
+            "state_json": str((runtime_dir / "state.json").resolve()),
+            "state_storage": str((runtime_dir / "crawl_state.json").resolve()),
+            "headless": payload.headless if payload.headless is not None else True,
+            "cooldown_every": payload.cooldown_every,
+            "cooldown_seconds": payload.cooldown_seconds,
+            "retry_times": payload.retry_times,
+            "retry_backoff_seconds": payload.retry_backoff_seconds,
+            "resume": payload.resume,
+        }
+
+    input_excel = str(payload.input_excel or "").strip()
+    if not input_excel:
+        raise HTTPException(status_code=400, detail="缺少 input_excel，或请改用 accounts JSON 模式")
+    output_dir = str(payload.output_dir or runtime_dir).strip() or str(runtime_dir)
+    output_excel = str(payload.output_excel or f"weiq_results_{task_key}.xlsx").strip()
+    state_json = str(payload.state_json or (runtime_dir / "state.json")).strip()
+    state_storage = str(payload.state_storage or (runtime_dir / "crawl_state.json")).strip()
+    return {
+        "input_excel": input_excel,
+        "output_excel": output_excel,
+        "output_dir": output_dir,
+        "state_json": state_json,
+        "state_storage": state_storage,
+        "headless": payload.headless if payload.headless is not None else True,
+        "cooldown_every": payload.cooldown_every,
+        "cooldown_seconds": payload.cooldown_seconds,
+        "retry_times": payload.retry_times,
+        "retry_backoff_seconds": payload.retry_backoff_seconds,
+        "resume": payload.resume,
+    }
+
+
 def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
     status = row.get("status", TaskStatus.PENDING)
     error_code = row.get("error_code") or ErrorCode.NONE
     message = row.get("message") or None
+    export_file = None
+    output_excel = str(row.get("output_excel") or "").strip()
+    output_dir = str(row.get("output_dir") or "").strip()
+    if output_excel:
+        output_path = Path(output_excel)
+        if not output_path.is_absolute():
+            output_path = Path(output_dir or ".") / output_path
+        export_file = str(output_path.resolve())
     if message and (error_code == ErrorCode.NONE or status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED_AUTH}):
         error_message_zh = message
     else:
@@ -267,6 +395,7 @@ def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
         "status_zh": STATUS_ZH.get(status, status),
         "error_message_zh": error_message_zh,
         "auth_waiting": status == TaskStatus.BLOCKED_AUTH,
+        "export_file": export_file,
     }
 
 
@@ -785,6 +914,8 @@ def run_task(task_id: str) -> None:
     row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
     if not row:
         return
+    if row["status"] in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        return
 
     if row["cancel_requested"]:
         upsert_task_event(
@@ -819,7 +950,7 @@ def run_task(task_id: str) -> None:
         {
             "status": TaskStatus.RUNNING,
             "started_at": now_iso(),
-            "message": "任务已启动",
+            "message": "WEIQ 执行器已接单，开始抓取",
         },
     )
 
@@ -855,23 +986,73 @@ def run_task(task_id: str) -> None:
 
 
 def worker_loop() -> None:
+    global LAST_WORKER_ERROR
     while True:
         task_id = TASK_QUEUE.get()
+        with QUEUE_LOCK:
+            QUEUED_TASK_IDS.discard(task_id)
         try:
             run_task(task_id)
+            LAST_WORKER_ERROR = None
+        except Exception as exc:
+            LAST_WORKER_ERROR = f"{now_iso()} {exc}"
+            upsert_task_event(
+                task_id,
+                {
+                    "status": TaskStatus.FAILED,
+                    "finished_at": now_iso(),
+                    "error_code": "INTERNAL_ERROR",
+                    "message": f"Worker 异常退出: {exc}",
+                },
+            )
         finally:
             TASK_QUEUE.task_done()
 
 
 def start_worker() -> None:
-    thread = threading.Thread(target=worker_loop, daemon=True)
+    global WORKER_THREAD, WORKER_STARTED_AT
+    if WORKER_THREAD is not None and WORKER_THREAD.is_alive():
+        return
+    thread = threading.Thread(target=worker_loop, daemon=True, name="weiq-task-worker")
     thread.start()
+    WORKER_THREAD = thread
+    WORKER_STARTED_AT = now_iso()
+
+
+def recover_incomplete_tasks() -> None:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, status FROM tasks WHERE status IN (?, ?)",
+                (TaskStatus.PENDING, TaskStatus.RUNNING),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    for row in rows:
+        task_id = str(row["task_id"])
+        status = str(row["status"])
+        if status == TaskStatus.RUNNING:
+            upsert_task_event(
+                task_id,
+                {
+                    "status": TaskStatus.PENDING,
+                    "message": "服务重启后重新入队",
+                    "progress": 0.0,
+                },
+            )
+        else:
+            upsert_task_event(task_id, {"message": "服务重启后重新入队"})
+        enqueue_task(task_id)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
+    ensure_single_worker_mode()
     init_db()
     start_worker()
+    recover_incomplete_tasks()
 
 
 @app.get("/health")
@@ -879,10 +1060,30 @@ def health() -> dict[str, str]:
     return {"status": "ok", "time": now_iso()}
 
 
+@app.get("/v1/worker/health", response_model=WorkerHealthResponse)
+def worker_health() -> WorkerHealthResponse:
+    pending_count = fetch_value("SELECT COUNT(1) FROM tasks WHERE status = ?", (TaskStatus.PENDING,))
+    running_count = fetch_value("SELECT COUNT(1) FROM tasks WHERE status = ?", (TaskStatus.RUNNING,))
+    with QUEUE_LOCK:
+        queued_ids = sorted(QUEUED_TASK_IDS)
+    return WorkerHealthResponse(
+        worker_alive=bool(WORKER_THREAD and WORKER_THREAD.is_alive()),
+        worker_started_at=WORKER_STARTED_AT,
+        queue_size=TASK_QUEUE.qsize(),
+        queued_task_ids=queued_ids,
+        pending_count=pending_count,
+        running_count=running_count,
+        last_worker_error=LAST_WORKER_ERROR,
+        process_id=os.getpid(),
+        db_path=str(DB_PATH),
+    )
+
+
 @app.post("/v1/tasks/crawl", response_model=TaskControlResponse)
 def create_task(payload: CreateTaskRequest) -> TaskControlResponse:
     task_id = uuid4().hex
     created_at = now_iso()
+    materialized = materialize_task_request(payload)
 
     execute(
         """
@@ -898,22 +1099,22 @@ def create_task(payload: CreateTaskRequest) -> TaskControlResponse:
             TaskStatus.PENDING,
             ErrorCode.NONE,
             "任务已创建，等待执行",
-            payload.input_excel,
-            payload.output_excel,
-            payload.output_dir,
-            payload.state_json,
-            payload.state_storage,
-            int(payload.headless),
-            payload.cooldown_every,
-            payload.cooldown_seconds,
-            payload.retry_times,
-            payload.retry_backoff_seconds,
-            int(payload.resume),
+            materialized["input_excel"],
+            materialized["output_excel"],
+            materialized["output_dir"],
+            materialized["state_json"],
+            materialized["state_storage"],
+            int(bool(materialized["headless"])),
+            materialized["cooldown_every"],
+            materialized["cooldown_seconds"],
+            materialized["retry_times"],
+            materialized["retry_backoff_seconds"],
+            int(bool(materialized["resume"])),
             created_at,
         ),
     )
 
-    TASK_QUEUE.put(task_id)
+    enqueue_task(task_id)
     return TaskControlResponse(task_id=task_id, status=TaskStatus.PENDING, message="任务已创建")
 
 
@@ -952,6 +1153,32 @@ def resume_task(task_id: str) -> TaskControlResponse:
 
     upsert_task_event(task_id, {"resume_requested": 1, "message": "已请求继续任务"})
     return TaskControlResponse(task_id=task_id, status=TaskStatus.RUNNING, message="继续请求已发送")
+
+
+@app.post("/v1/tasks/{task_id}/requeue", response_model=TaskControlResponse)
+def requeue_task(task_id: str) -> TaskControlResponse:
+    row = fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] == TaskStatus.SUCCESS:
+        raise HTTPException(status_code=409, detail="成功任务不允许重新入队")
+
+    upsert_task_event(
+        task_id,
+        {
+            "status": TaskStatus.PENDING,
+            "progress": 0.0,
+            "cancel_requested": 0,
+            "resume_requested": 0,
+            "blocked_reason": None,
+            "current_account": None,
+            "started_at": None,
+            "finished_at": None,
+            "message": "任务已重新入队",
+        },
+    )
+    enqueue_task(task_id)
+    return TaskControlResponse(task_id=task_id, status=TaskStatus.PENDING, message="任务已重新入队")
 
 
 @app.post("/v1/auth/session", response_model=AuthSessionResponse)
@@ -1076,3 +1303,29 @@ def get_task_quality(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="结果文件不存在")
     df = load_result_df(output_excel)
     return quality_report(df=df, run_id=run_id)
+
+
+@app.get("/v1/tasks/{task_id}/export")
+def export_task_result(task_id: str):
+    row = fetch_one("SELECT status, output_excel, output_dir FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] != TaskStatus.SUCCESS:
+        raise HTTPException(status_code=409, detail="任务尚未成功完成，暂不能导出结果")
+
+    output_excel = str(row.get("output_excel") or "").strip()
+    output_dir = str(row.get("output_dir") or "").strip()
+    if not output_excel:
+        raise HTTPException(status_code=404, detail="结果文件不存在")
+    output_path = Path(output_excel)
+    if not output_path.is_absolute():
+        output_path = Path(output_dir or ".") / output_path
+    output_path = output_path.resolve()
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="结果文件不存在")
+
+    return FileResponse(
+        path=str(output_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=output_path.name,
+    )

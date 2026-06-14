@@ -126,7 +126,7 @@ class CrawlConfig:
     output_excel: str = OUTPUT_EXCEL
     state_json: str = STATE_JSON
     output_dir: str = "."
-    headless: bool = False
+    headless: bool = True
     cooldown_every: int = 50
     cooldown_seconds: int = 180
     wait_min_seconds: int = 2
