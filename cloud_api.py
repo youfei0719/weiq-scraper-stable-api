@@ -21,6 +21,8 @@ from scraper_runtime import (
     ErrorCode,
     TaskStatus,
     detect_auth_or_challenge,
+    extract_metrics,
+    infer_post_extraction_issue,
     run_crawl,
 )
 
@@ -420,6 +422,29 @@ def wait_for_page_settle(page, timeout_ms: int = 2500) -> None:
         time.sleep(1)
 
 
+def infer_runtime_auth_requirement(page) -> tuple[bool, str]:
+    needs_auth, reason_code = detect_auth_or_challenge(page)
+    if needs_auth:
+        return True, reason_code
+
+    page_text = ""
+    try:
+        page_text = page.locator("body").inner_text(timeout=1500) or ""
+    except Exception:
+        page_text = ""
+
+    extracted_data = extract_metrics(page)
+    post_issue = infer_post_extraction_issue(
+        page_url=page.url,
+        page_text=page_text,
+        has_login_form=find_first_visible(iter_login_targets(page), USERNAME_SELECTORS + PASSWORD_SELECTORS + CODE_SELECTORS) is not None,
+        extracted_data=extracted_data,
+    )
+    if post_issue in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+        return True, post_issue
+    return False, ErrorCode.NONE
+
+
 def sanitize_account_text(value: str | None) -> str:
     return re.sub(r"\s+", "", str(value or "")).strip()
 
@@ -491,7 +516,7 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             raise HTTPException(status_code=422, detail="未找到登录提交按钮，请检查当前 WEIQ 登录页")
         wait_for_page_settle(page)
 
-        needs_auth, reason_code = detect_auth_or_challenge(page)
+        needs_auth, reason_code = infer_runtime_auth_requirement(page)
         if not needs_auth:
             try:
                 context.storage_state(path=state_json)
@@ -618,7 +643,7 @@ def inspect_active_auth_session(session_id: str) -> Optional[dict[str, Any]]:
     context = session["context"]
     state_json = session["state_json"]
     with session["lock"]:
-        needs_auth, reason_code = detect_auth_or_challenge(page)
+        needs_auth, reason_code = infer_runtime_auth_requirement(page)
         if not needs_auth:
             try:
                 context.storage_state(path=state_json)
