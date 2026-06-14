@@ -75,6 +75,18 @@ class TestCloudAPI(unittest.TestCase):
             )
             self.assertEqual(submit_resp.status_code, 409)
 
+    def test_build_status_payload_prefers_runtime_message_while_running(self):
+        payload = cloud_api.build_status_payload(
+            {
+                "task_id": "task-1",
+                "status": cloud_api.TaskStatus.RUNNING,
+                "error_code": cloud_api.ErrorCode.NONE,
+                "message": "正在抓取 中华小鸣仔（第 2/4 个）",
+            }
+        )
+
+        self.assertEqual(payload["error_message_zh"], "正在抓取 中华小鸣仔（第 2/4 个）")
+
 
 if __name__ == "__main__":
     unittest.main()

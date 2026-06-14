@@ -37,6 +37,42 @@ METRIC_KEYS = [
     "最高阅读量",
     "阅读量均值",
 ]
+CRITICAL_METRIC_KEYS = ["粉丝数", "直发CPM", "阅读中位数", "发布博文数"]
+EMPTY_METRIC_MARKERS = {
+    "",
+    "-",
+    "--",
+    "空",
+    "空_无标签",
+    "空_无数据",
+    "暂无",
+    "未收录",
+    "未抓取",
+    "未获取",
+    "等待登录",
+    "待登录",
+    "登录失效",
+}
+LOGIN_HINT_KEYWORDS = [
+    "请先登录",
+    "登录后",
+    "立即登录",
+    "账号密码",
+    "手机号登录",
+    "手机验证码",
+    "发送验证码",
+    "获取验证码",
+    "短信验证码",
+]
+CAPTCHA_HINT_KEYWORDS = ["滑动验证", "安全访问验证", "请输入验证码", "访问过于频繁", "安全验证"]
+LOGIN_FORM_SELECTORS = [
+    "input[type='password']",
+    "input[placeholder*='密码']",
+    "input[placeholder*='验证码']",
+    "input[placeholder*='手机号']",
+    "input[placeholder*='账号']",
+    "input[placeholder*='用户名']",
+]
 
 RESULT_META_KEYS = ["run_id", "crawl_time", "account_status", "error_code", "error_message"]
 
@@ -201,6 +237,90 @@ def should_stop(hooks: CrawlHooks) -> bool:
     return False
 
 
+def _normalize_metric_text(value: Any) -> str:
+    return str(value or "").strip().replace("\u3000", "").replace(" ", "").lower()
+
+
+def _is_empty_metric_value(value: Any) -> bool:
+    return _normalize_metric_text(value) in EMPTY_METRIC_MARKERS
+
+
+def _parse_metric_number(value: Any) -> float:
+    text = str(value or "").strip().replace(",", "").replace("¥", "").replace("元", "")
+    if not text or _is_empty_metric_value(text):
+        return 0.0
+    multiplier = 1.0
+    if text.endswith("万") or text.lower().endswith("w"):
+        multiplier = 10000.0
+        text = text[:-1]
+    elif text.lower().endswith("k"):
+        multiplier = 1000.0
+        text = text[:-1]
+    elif text.endswith("亿"):
+        multiplier = 100000000.0
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return 0.0
+
+
+def _count_effective_metrics(extracted_data: dict[str, str], keys: list[str]) -> int:
+    count = 0
+    for key in keys:
+        value = extracted_data.get(key)
+        if _is_empty_metric_value(value):
+            continue
+        if _parse_metric_number(value) > 0:
+            count += 1
+    return count
+
+
+def _safe_body_text(page) -> str:
+    try:
+        return page.locator("body").inner_text(timeout=2000) or ""
+    except Exception:
+        return ""
+
+
+def _page_has_visible_login_form(page) -> bool:
+    for selector in LOGIN_FORM_SELECTORS:
+        try:
+            locator = page.locator(selector)
+            count = min(locator.count(), 4)
+            for index in range(count):
+                if locator.nth(index).is_visible():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def infer_post_extraction_issue(
+    *,
+    page_url: str,
+    page_text: str,
+    has_login_form: bool,
+    extracted_data: dict[str, str],
+) -> str:
+    merged_text = f"{page_url}\n{page_text}".lower()
+    if any(keyword.lower() in merged_text for keyword in CAPTCHA_HINT_KEYWORDS):
+        return ErrorCode.CAPTCHA_REQUIRED
+
+    core_valid_count = _count_effective_metrics(extracted_data, CRITICAL_METRIC_KEYS)
+    if core_valid_count >= 2:
+        return ErrorCode.NONE
+
+    if has_login_form or any(keyword.lower() in merged_text for keyword in LOGIN_HINT_KEYWORDS):
+        return ErrorCode.AUTH_REQUIRED
+
+    overall_valid_count = _count_effective_metrics(extracted_data, METRIC_KEYS)
+    if overall_valid_count == 0:
+        return ErrorCode.EMPTY_PAGE
+
+    return ErrorCode.EMPTY_PAGE
+
+
 def default_auth_handler(reason_code: str, page_url: str, page=None, context=None, state_file: str = STATE_JSON) -> bool:
     print(f"\n[风控警告] 触发 {reason_code}，当前页面: {page_url}")
     print(">>>>> 请立即在浏览器中手动登录或验证，处理完成后回到终端继续 <<<<<")
@@ -353,10 +473,11 @@ def detect_auth_or_challenge(page) -> tuple[bool, str]:
         return True, ErrorCode.AUTH_REQUIRED
 
     try:
-        anti_keywords = ["滑动验证", "安全访问验证", "请输入验证码", "访问过于频繁"]
-        page_text = page.locator("body").inner_text(timeout=2000)
-        if any(keyword in page_text for keyword in anti_keywords):
+        page_text = _safe_body_text(page)
+        if any(keyword in page_text for keyword in CAPTCHA_HINT_KEYWORDS):
             return True, ErrorCode.CAPTCHA_REQUIRED
+        if _page_has_visible_login_form(page) and any(keyword in page_text for keyword in LOGIN_HINT_KEYWORDS):
+            return True, ErrorCode.AUTH_REQUIRED
     except Exception:
         pass
 
@@ -471,17 +592,54 @@ def process_account_url(
                 )
 
             extracted_data = extract_metrics(page)
-            valid_count = sum(1 for value in extracted_data.values() if "空" not in str(value))
-            if valid_count == 0:
+            page_text = _safe_body_text(page)
+            has_login_form = _page_has_visible_login_form(page)
+            issue_code = infer_post_extraction_issue(
+                page_url=page.url,
+                page_text=page_text,
+                has_login_form=has_login_form,
+                extracted_data=extracted_data,
+            )
+            overall_valid_count = _count_effective_metrics(extracted_data, METRIC_KEYS)
+            core_valid_count = _count_effective_metrics(extracted_data, CRITICAL_METRIC_KEYS)
+
+            if issue_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+                auth_handler = hooks.on_auth_required or default_auth_handler
+                emit_event(
+                    hooks,
+                    {
+                        "type": "auth_required",
+                        "reason_code": issue_code,
+                        "page_url": page.url,
+                        "current_index": current_idx,
+                        "total_accounts": total_accounts,
+                    },
+                )
+                if auth_handler(issue_code, page.url, page, context, config.state_json):
+                    if attempt < config.retry_times:
+                        print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
+                        time.sleep(config.retry_backoff_seconds)
+                        continue
+                return AccountProcessResult(
+                    metrics={k: "等待登录" for k in METRIC_KEYS},
+                    account_status=AccountStatus.FAILED,
+                    error_code=issue_code,
+                    error_message=ERROR_MESSAGES_ZH[issue_code],
+                )
+
+            if issue_code == ErrorCode.EMPTY_PAGE:
                 print(f"{progress} ⚠️ 页面似乎无有效数据。")
                 return AccountProcessResult(
-                    metrics={k: "账号失效/未收录" for k in METRIC_KEYS},
+                    metrics=extracted_data,
                     account_status=AccountStatus.FAILED,
                     error_code=ErrorCode.EMPTY_PAGE,
                     error_message=ERROR_MESSAGES_ZH[ErrorCode.EMPTY_PAGE],
                 )
 
-            print(f"{progress} ✅ 成功提取 {valid_count} 项核心指标。")
+            print(
+                f"{progress} ✅ 成功提取有效指标：核心 {core_valid_count}/{len(CRITICAL_METRIC_KEYS)}，"
+                f"总计 {overall_valid_count}/{len(METRIC_KEYS)}。"
+            )
             return AccountProcessResult(
                 metrics=extracted_data,
                 account_status=AccountStatus.SUCCESS,
@@ -633,6 +791,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                         "processed": processed_accounts,
                         "total": total_accounts,
                         "error_code": ErrorCode.NONE,
+                        "message": f"已跳过 {aid}（{processed_accounts}/{total_accounts}）",
                     },
                 )
                 continue
@@ -647,6 +806,22 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                     sys.stdout.flush()
                     time.sleep(1)
                 print("")
+
+            current_account_label = f"{aid}（UID: {uid}）"
+            emit_event(
+                hooks,
+                {
+                    "type": "progress",
+                    "run_id": run_id,
+                    "status": TaskStatus.RUNNING,
+                    "current_account": current_account_label,
+                    "progress": processed_accounts / total_accounts if total_accounts else 1.0,
+                    "processed": processed_accounts,
+                    "total": total_accounts,
+                    "error_code": ErrorCode.NONE,
+                    "message": f"正在抓取 {aid}（第 {current_idx}/{total_accounts} 个）",
+                },
+            )
 
             url = f"https://weiq.com/client/product/weibo/detail?account_uid={uid}"
             process_result = process_account_url(
@@ -693,11 +868,12 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                         "type": "progress",
                         "run_id": run_id,
                         "status": TaskStatus.RUNNING,
-                        "current_account": aid,
+                        "current_account": current_account_label,
                         "progress": processed_accounts / total_accounts if total_accounts else 1.0,
                         "processed": processed_accounts,
                         "total": total_accounts,
                         "error_code": ErrorCode.WRITE_ERROR,
+                        "message": f"{aid} 写入结果失败（{processed_accounts}/{total_accounts}）",
                     },
                 )
                 continue
@@ -716,11 +892,12 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                     "type": "progress",
                     "run_id": run_id,
                     "status": TaskStatus.RUNNING,
-                    "current_account": aid,
+                    "current_account": current_account_label,
                     "progress": processed_accounts / total_accounts if total_accounts else 1.0,
                     "processed": processed_accounts,
                     "total": total_accounts,
                     "error_code": process_result.error_code,
+                    "message": f"已完成 {aid}（{processed_accounts}/{total_accounts}）",
                 },
             )
 
@@ -733,10 +910,6 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
     if should_stop(hooks):
         task_status = TaskStatus.CANCELLED
         error_code = ErrorCode.CANCELLED
-    elif failed_accounts > 0 and success_accounts == 0:
-        task_status = TaskStatus.FAILED
-        error_code = ErrorCode.NAVIGATION_ERROR
-
     finished_at = now_iso()
     emit_event(
         hooks,

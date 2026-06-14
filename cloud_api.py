@@ -255,10 +255,15 @@ def fetch_auth_session(session_id: str) -> Optional[dict[str, Any]]:
 def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
     status = row.get("status", TaskStatus.PENDING)
     error_code = row.get("error_code") or ErrorCode.NONE
+    message = row.get("message") or None
+    if message and (error_code == ErrorCode.NONE or status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED_AUTH}):
+        error_message_zh = message
+    else:
+        error_message_zh = ERROR_MESSAGES_ZH.get(error_code, message or error_code)
     return {
         **row,
         "status_zh": STATUS_ZH.get(status, status),
-        "error_message_zh": ERROR_MESSAGES_ZH.get(error_code, row.get("message") or error_code),
+        "error_message_zh": error_message_zh,
         "auth_waiting": status == TaskStatus.BLOCKED_AUTH,
     }
 
