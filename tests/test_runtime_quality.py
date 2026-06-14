@@ -1,3 +1,6 @@
+import json
+import tempfile
+from pathlib import Path
 import unittest
 
 from scraper_runtime import (
@@ -5,12 +8,19 @@ from scraper_runtime import (
     ErrorCode,
     METRIC_KEYS,
     _count_effective_metrics,
+    has_usable_storage_state,
     infer_blocked_response_issue,
     infer_post_extraction_issue,
 )
 
 
 class RuntimeQualityTest(unittest.TestCase):
+    def test_empty_storage_state_is_treated_as_not_logged_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            path.write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
+            self.assertFalse(has_usable_storage_state(str(path)))
+
     def test_blocked_response_with_login_hints_is_treated_as_auth_required(self) -> None:
         class _LocatorItem:
             def is_visible(self) -> bool:

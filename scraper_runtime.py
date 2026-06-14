@@ -345,6 +345,19 @@ def resolve_output_path(output_dir: str, output_excel: str) -> str:
     return str((out_dir / out_path).resolve())
 
 
+def has_usable_storage_state(state_file: str) -> bool:
+    path = Path(state_file)
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    cookies = payload.get("cookies")
+    origins = payload.get("origins")
+    return bool(cookies or origins)
+
+
 def load_accounts(input_excel: str) -> pd.DataFrame:
     df = pd.read_excel(input_excel)
     if "uid" not in df.columns:
@@ -776,6 +789,53 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
 
     with sync_playwright() as p:
         browser, context, page = init_browser(p, config.state_json, config.headless)
+
+        if not has_usable_storage_state(config.state_json):
+            print("[初始化] 当前没有可用的 WEIQ 登录态，先进入登录流程。")
+            login_url = "https://www.weiq.com/"
+            try:
+                page.goto(login_url, timeout=config.goto_timeout_ms, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            auth_handler = hooks.on_auth_required or default_auth_handler
+            emit_event(
+                hooks,
+                {
+                    "type": "auth_required",
+                    "reason_code": ErrorCode.AUTH_REQUIRED,
+                    "page_url": page.url or login_url,
+                    "current_index": 0,
+                    "total_accounts": total_accounts,
+                },
+            )
+            if not auth_handler(ErrorCode.AUTH_REQUIRED, page.url or login_url, page, context, config.state_json):
+                context.storage_state(path=config.state_json)
+                browser.close()
+                finished_at = now_iso()
+                emit_event(
+                    hooks,
+                    {
+                        "type": "task_status",
+                        "run_id": run_id,
+                        "status": TaskStatus.FAILED,
+                        "finished_at": finished_at,
+                        "progress": 0.0,
+                        "error_code": ErrorCode.AUTH_REQUIRED,
+                    },
+                )
+                return CrawlRunResult(
+                    run_id=run_id,
+                    status=TaskStatus.FAILED,
+                    total_accounts=total_accounts,
+                    processed_accounts=0,
+                    success_accounts=0,
+                    failed_accounts=0,
+                    skipped_accounts=0,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    output_excel=output_excel,
+                    error_code=ErrorCode.AUTH_REQUIRED,
+                )
 
         for index, row in df.iterrows():
             current_idx = index + 1
