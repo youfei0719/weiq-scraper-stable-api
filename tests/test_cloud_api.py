@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,22 @@ from fastapi.testclient import TestClient
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+if "playwright.sync_api" not in sys.modules:
+    playwright_module = types.ModuleType("playwright")
+    playwright_sync_api_module = types.ModuleType("playwright.sync_api")
+
+    class _PlaywrightTimeoutError(Exception):
+        pass
+
+    def _sync_playwright():  # noqa: ANN202
+        raise RuntimeError("playwright is not installed in this test environment")
+
+    playwright_sync_api_module.TimeoutError = _PlaywrightTimeoutError
+    playwright_sync_api_module.sync_playwright = _sync_playwright
+    playwright_module.sync_api = playwright_sync_api_module
+    sys.modules["playwright"] = playwright_module
+    sys.modules["playwright.sync_api"] = playwright_sync_api_module
 
 import cloud_api
 
@@ -41,7 +58,7 @@ class TestCloudAPI(unittest.TestCase):
             self.assertEqual(resp.json()["status"], "ok")
 
     def test_task_lifecycle_minimal(self):
-        with patch("cloud_api.run_crawl", side_effect=RuntimeError("boom")):
+        with patch("cloud_api.enqueue_task", return_value=True), patch("cloud_api.run_crawl", side_effect=RuntimeError("boom")):
             with TestClient(cloud_api.app) as client:
                 create_resp = client.post(
                     "/v1/tasks/crawl",
@@ -53,39 +70,64 @@ class TestCloudAPI(unittest.TestCase):
                 )
                 self.assertEqual(create_resp.status_code, 200)
                 task_id = create_resp.json()["task_id"]
-                cloud_api.run_task(task_id)
+                with patch("cloud_api.uuid4") as uuid_mock, patch(
+                    "cloud_api._build_eager_auth_session_state",
+                ) as eager_mock:
+                    uuid_mock.return_value.hex = "sess-lifecycle-1"
+                    eager_mock.return_value = {
+                        "session_id": "sess-lifecycle-1",
+                        "task_id": task_id,
+                        "status": "waiting_credentials",
+                        "state_storage": cloud_api.build_auth_session_paths("sess-lifecycle-1")["state_storage"],
+                        "message": "等待登录",
+                        "expires_at": cloud_api.expiry_iso(),
+                    }
+                    cloud_api.run_task(task_id)
                 task_resp = client.get(f"/v1/tasks/{task_id}")
                 self.assertEqual(task_resp.status_code, 200)
-                self.assertIn(task_resp.json()["status"], {"FAILED", "SUCCESS", "CANCELLED"})
+                self.assertIn(task_resp.json()["status"], {"FAILED", "SUCCESS", "CANCELLED", "BLOCKED_AUTH"})
 
                 cancel_resp = client.post(f"/v1/tasks/{task_id}/cancel")
                 self.assertEqual(cancel_resp.status_code, 200)
 
     def test_auth_session_endpoints_minimal(self):
+        with patch("cloud_api.ensure_auth_session_runtime", side_effect=lambda session_id: cloud_api.fetch_auth_session(session_id)):
+            with TestClient(cloud_api.app) as client:
+                create_resp = client.post("/v1/auth/session")
+                self.assertEqual(create_resp.status_code, 200)
+                session = create_resp.json()
+                self.assertEqual(session["status"], "waiting_credentials")
+                self.assertIn("password", session["available_login_types"])
+                self.assertIn("phone_code", session["available_login_types"])
+
+                get_resp = client.get(f"/v1/auth/session/{session['session_id']}")
+                self.assertEqual(get_resp.status_code, 200)
+                self.assertEqual(get_resp.json()["session_id"], session["session_id"])
+
+                submit_resp = client.post(
+                    f"/v1/auth/session/{session['session_id']}/submit",
+                    json={"login_type": "password", "username": "demo", "password": "demo"},
+                )
+                self.assertEqual(submit_resp.status_code, 409)
+
+    def test_create_auth_session_uses_per_task_state_storage_directory(self):
         with TestClient(cloud_api.app) as client:
             create_resp = client.post("/v1/auth/session")
             self.assertEqual(create_resp.status_code, 200)
             session = create_resp.json()
-            self.assertEqual(session["status"], "pending")
-            self.assertIn("password", session["available_login_types"])
-            self.assertIn("phone_code", session["available_login_types"])
-
-            get_resp = client.get(f"/v1/auth/session/{session['session_id']}")
-            self.assertEqual(get_resp.status_code, 200)
-            self.assertEqual(get_resp.json()["session_id"], session["session_id"])
-
-            submit_resp = client.post(
-                f"/v1/auth/session/{session['session_id']}/submit",
-                json={"login_type": "password", "username": "demo", "password": "demo"},
-            )
-            self.assertEqual(submit_resp.status_code, 409)
+        row = cloud_api.fetch_auth_session(session["session_id"])
+        assert row is not None
+        state_storage = str(row["state_storage"])
+        self.assertIn(f"auth_sessions/{session['session_id']}/storage_state.json", state_storage)
+        self.assertTrue(Path(state_storage).parent.exists())
 
     def test_create_auth_session_eager_binds_task_and_returns_waiting_state(self):
-        task = cloud_api.create_task(
-            cloud_api.CreateTaskRequest(
-                accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+        with patch("cloud_api.enqueue_task", return_value=True):
+            task = cloud_api.create_task(
+                cloud_api.CreateTaskRequest(
+                    accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+                )
             )
-        )
 
         eager_row = {
             "session_id": "sess-eager-1",
@@ -112,6 +154,40 @@ class TestCloudAPI(unittest.TestCase):
         task_row = cloud_api.fetch_one("SELECT login_session_id FROM tasks WHERE task_id = ?", (task.task_id,))
         assert task_row is not None
         self.assertEqual(task_row["login_session_id"], "sess-eager-1")
+
+    def test_check_auth_session_uses_current_session_storage_and_requeues_task(self):
+        with patch("cloud_api.enqueue_task", return_value=True):
+            task = cloud_api.create_task(
+                cloud_api.CreateTaskRequest(
+                    accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+                )
+            )
+        session_id = "sess-check-1"
+        paths = cloud_api.build_auth_session_paths(session_id)
+        Path(paths["state_storage"]).write_text(json.dumps({"cookies": [{"name": "sid"}], "origins": []}), encoding="utf-8")
+        cloud_api.upsert_auth_session(
+            session_id,
+            {
+                "task_id": task.task_id,
+                "status": "waiting_credentials",
+                "state_storage": paths["state_storage"],
+                "message": "等待登录",
+                "expires_at": cloud_api.expiry_iso(),
+            },
+        )
+        cloud_api.upsert_task_event(task.task_id, {"login_session_id": session_id, "status": cloud_api.TaskStatus.BLOCKED_AUTH})
+
+        with TestClient(cloud_api.app) as client, patch("cloud_api.enqueue_task", return_value=True):
+            resp = client.post(f"/v1/auth/session/{session_id}/check")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "authenticated")
+        row = cloud_api.fetch_auth_session(session_id)
+        assert row is not None
+        self.assertEqual(row["status"], "authenticated")
+        task_row = cloud_api.fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task.task_id,))
+        assert task_row is not None
+        self.assertEqual(task_row["status"], cloud_api.TaskStatus.PENDING)
 
     def test_inspect_active_auth_session_requires_usable_storage_state(self):
         class _Locator:
@@ -146,7 +222,7 @@ class TestCloudAPI(unittest.TestCase):
                 task_id="task-auth-check",
                 page=_Page(),
                 context=_Context(),
-                state_json=str(state_path),
+                state_storage=str(state_path),
                 login_url="https://www.weiq.com/",
             )
 
@@ -158,7 +234,7 @@ class TestCloudAPI(unittest.TestCase):
 
         assert row is not None
         self.assertEqual(row["status"], "waiting_credentials")
-        self.assertIn("尚未检测到有效的 WEIQ 登录态", row["message"])
+        self.assertIn("本机 Chrome 登录不会同步到服务器", row["message"])
 
     def test_build_status_payload_exposes_queue_and_login_state(self):
         cloud_api.upsert_auth_session(
@@ -229,6 +305,24 @@ class TestCloudAPI(unittest.TestCase):
                 )
             )
 
+        session_id = "sess-failed-1"
+        state_storage = cloud_api.build_auth_session_paths(session_id)["state_storage"]
+        Path(state_storage).write_text(
+            json.dumps({"cookies": [{"name": "sid"}], "origins": []}),
+            encoding="utf-8",
+        )
+        cloud_api.upsert_auth_session(
+            session_id,
+            {
+                "task_id": task.task_id,
+                "status": "authenticated",
+                "state_storage": state_storage,
+                "message": "ok",
+                "expires_at": cloud_api.expiry_iso(),
+            },
+        )
+        cloud_api.upsert_task_event(task.task_id, {"login_session_id": session_id})
+
         with patch("cloud_api.run_crawl", side_effect=RuntimeError("boom")):
             cloud_api.run_task(task.task_id)
 
@@ -236,6 +330,38 @@ class TestCloudAPI(unittest.TestCase):
         assert row is not None
         self.assertEqual(row["status"], cloud_api.TaskStatus.FAILED)
         self.assertIn("任务异常崩溃", row["message"])
+
+    def test_run_task_blocks_when_task_has_no_authenticated_session(self):
+        with patch("cloud_api.enqueue_task", return_value=True):
+            task = cloud_api.create_task(
+                cloud_api.CreateTaskRequest(
+                    accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],
+                )
+            )
+
+        eager_row = {
+            "session_id": "sess-blocked-1",
+            "task_id": task.task_id,
+            "status": "waiting_credentials",
+            "login_url": "https://www.weiq.com/",
+            "state_storage": cloud_api.build_auth_session_paths("sess-blocked-1")["state_storage"],
+            "message": "等待登录",
+            "expires_at": cloud_api.expiry_iso(),
+        }
+
+        with patch("cloud_api.uuid4") as uuid_mock, patch(
+            "cloud_api._build_eager_auth_session_state",
+            return_value=eager_row,
+        ), patch("cloud_api.run_crawl") as run_crawl_mock:
+            uuid_mock.return_value.hex = "sess-blocked-1"
+            cloud_api.run_task(task.task_id)
+
+        run_crawl_mock.assert_not_called()
+        row = cloud_api.fetch_one("SELECT status, login_session_id, blocked_reason FROM tasks WHERE task_id = ?", (task.task_id,))
+        assert row is not None
+        self.assertEqual(row["status"], cloud_api.TaskStatus.BLOCKED_AUTH)
+        self.assertTrue(str(row["login_session_id"]))
+        self.assertEqual(row["blocked_reason"], cloud_api.ErrorCode.AUTH_REQUIRED)
 
     def test_recover_incomplete_tasks_requeues_pending_and_running(self):
         cloud_api.execute(
@@ -334,7 +460,7 @@ class TestCloudAPI(unittest.TestCase):
         self.assertTrue("重新入队" in row["message"] or "已接单" in row["message"])
 
     def test_export_endpoint_requires_success_and_returns_file(self):
-        with TestClient(cloud_api.app) as client:
+        with TestClient(cloud_api.app) as client, patch("cloud_api.enqueue_task", return_value=True):
             task = cloud_api.create_task(
                 cloud_api.CreateTaskRequest(
                     accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")],

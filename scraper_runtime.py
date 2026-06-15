@@ -18,7 +18,7 @@ from playwright.sync_api import sync_playwright
 INPUT_EXCEL = "accounts.xlsx"
 OUTPUT_EXCEL = "weiq_results.xlsx"
 STATE_JSON = "state.json"
-STATE_STORE_JSON = "crawl_state.json"
+STATE_STORE_JSON = "storage_state.json"
 
 METRIC_KEYS = [
     "粉丝数",
@@ -579,7 +579,7 @@ def process_account_url(
                             "total_accounts": total_accounts,
                         },
                     )
-                    if auth_handler(issue_code, page.url, page, context, config.state_json):
+                    if auth_handler(issue_code, page.url, page, context, config.state_storage):
                         if attempt < config.retry_times:
                             print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
                             time.sleep(config.retry_backoff_seconds)
@@ -634,7 +634,7 @@ def process_account_url(
                         "total_accounts": total_accounts,
                     },
                 )
-                if auth_handler(reason_code, page.url, page, context, config.state_json):
+                if auth_handler(reason_code, page.url, page, context, config.state_storage):
                     if attempt < config.retry_times:
                         print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
                         time.sleep(config.retry_backoff_seconds)
@@ -670,7 +670,7 @@ def process_account_url(
                         "total_accounts": total_accounts,
                     },
                 )
-                if auth_handler(issue_code, page.url, page, context, config.state_json):
+                if auth_handler(issue_code, page.url, page, context, config.state_storage):
                     if attempt < config.retry_times:
                         print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
                         time.sleep(config.retry_backoff_seconds)
@@ -740,7 +740,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
 
     input_excel = str(Path(config.input_excel).resolve())
     output_excel = resolve_output_path(config.output_dir, config.output_excel)
-    state_store = StateStore(config.state_storage or config.state_json)
+    state_store = StateStore(config.state_json or config.state_storage)
 
     run_id = config.run_id
     if not run_id:
@@ -789,10 +789,10 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
     print(f"[系统] 本次 run_id={run_id}，任务总数 {total_accounts}。")
 
     with sync_playwright() as p:
-        browser, context, page = init_browser(p, config.state_json, config.headless)
+        browser, context, page = init_browser(p, config.state_storage, config.headless)
 
-        if not has_usable_storage_state(config.state_json):
-            print("[初始化] 当前没有可用的 WEIQ 登录态，先进入登录流程。")
+        if not has_usable_storage_state(config.state_storage):
+            print("[初始化] 当前任务没有可用的 WEIQ 临时登录态。")
             login_url = "https://www.weiq.com/"
             try:
                 page.goto(login_url, timeout=config.goto_timeout_ms, wait_until="domcontentloaded")
@@ -809,8 +809,11 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                     "total_accounts": total_accounts,
                 },
             )
-            if not auth_handler(ErrorCode.AUTH_REQUIRED, page.url or login_url, page, context, config.state_json):
-                context.storage_state(path=config.state_json)
+            if not auth_handler(ErrorCode.AUTH_REQUIRED, page.url or login_url, page, context, config.state_storage):
+                try:
+                    context.storage_state(path=config.state_storage)
+                except Exception:
+                    pass
                 browser.close()
                 finished_at = now_iso()
                 emit_event(
@@ -818,7 +821,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                     {
                         "type": "task_status",
                         "run_id": run_id,
-                        "status": TaskStatus.FAILED,
+                        "status": TaskStatus.BLOCKED_AUTH,
                         "finished_at": finished_at,
                         "progress": 0.0,
                         "error_code": ErrorCode.AUTH_REQUIRED,
@@ -826,7 +829,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                 )
                 return CrawlRunResult(
                     run_id=run_id,
-                    status=TaskStatus.FAILED,
+                    status=TaskStatus.BLOCKED_AUTH,
                     total_accounts=total_accounts,
                     processed_accounts=0,
                     success_accounts=0,
@@ -1008,12 +1011,22 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                 },
             )
 
-        context.storage_state(path=config.state_json)
+            if process_result.error_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+                terminal_failure_code = process_result.error_code
+                break
+
+        try:
+            context.storage_state(path=config.state_storage)
+        except Exception:
+            pass
         browser.close()
 
     if should_stop(hooks):
         task_status = TaskStatus.CANCELLED
         error_code = ErrorCode.CANCELLED
+    elif terminal_failure_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+        task_status = TaskStatus.BLOCKED_AUTH
+        error_code = terminal_failure_code
     elif success_accounts > 0:
         task_status = TaskStatus.SUCCESS
         error_code = ErrorCode.NONE

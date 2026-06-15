@@ -14,7 +14,7 @@ WEIQ 项目用于采集账号数据、记录字段变化，并对网站提供标
 
 ## 2. 当前版本能力总览
 
-- 登录阻塞可恢复：登录失效时浏览器保持打开，用户登录后点击“继续”再恢复任务。
+- 任务级临时登录态：每个抓取任务单独创建一份远端临时 `storage_state.json`，登录成功后只供当前任务使用。
 - 任务可观测：状态、进度、当前账号、结构化日志、错误码与中文提示可实时查看。
 - 旧库兼容：支持旧 SQLite 结构兼容运行，避免升级后直接报错卡死。
 - 多账号表运行：可选择 `inputs/` 下不同 Excel 作为任务输入源。
@@ -179,6 +179,11 @@ python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080 --workers 1
 
 说明：
 - 当前云端 API 依赖进程内任务队列，只支持单 worker 进程模式。
+- 默认认证模式为 `WEIQ_AUTH_MODE=per_task`。
+- 可选环境变量：
+  - `WEIQ_AUTH_SESSION_TTL_SECONDS=600`
+  - `WEIQ_AUTH_STATE_DIR=/opt/weiq-scraper-stable-api/runtime/auth_sessions`
+  - `WEIQ_KEEP_AUTH_STATE_FOR_DEBUG=false`
 - 如果后续需要多 worker/多实例，请改为 Redis、Celery、RQ 等外部队列方案。
 ```
 
@@ -338,9 +343,10 @@ app.listen(3000);
 ### 问题 2：登录页闪烁、反复跳转
 
 处理策略：
-- 等待登录态时采集流程停止导航；
-- 手动点击继续后才恢复；
-- 若仍失败，检查网络与风控并重试。
+- 等待登录态时任务进入 `BLOCKED_AUTH`；
+- 通过 `POST /v1/auth/session/{session_id}/submit` 和 `POST /v1/auth/session/{session_id}/check` 完成当前任务的远端临时登录；
+- 登录成功后任务重新入队继续；
+- 任务成功、失败、取消后默认删除 `runtime/auth_sessions/{session_id}/`。
 
 ### 问题 3：导出文件不在预期目录
 
@@ -352,6 +358,8 @@ app.listen(3000);
 ## 8. 安全与敏感信息
 
 严禁提交到仓库的内容：
+- `runtime/auth_sessions/*/storage_state.json`
+- `runtime/auth_sessions/*/preview.png`
 - `state.json`
 - `*.db`
 - `accounts.xlsx`, `inputs/*.xlsx`

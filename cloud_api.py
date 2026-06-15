@@ -1,7 +1,9 @@
 import base64
+import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -43,6 +45,7 @@ ACTIVE_TASK_IDS: set[str] = set()
 WORKER_THREAD: threading.Thread | None = None
 WORKER_STARTED_AT: str | None = None
 LAST_WORKER_ERROR: str | None = None
+AUTH_WAITING_STATUSES = {"pending", "waiting_credentials", "waiting_code", "logging_in"}
 
 STATUS_ZH = {
     TaskStatus.PENDING: "排队中",
@@ -165,7 +168,55 @@ def get_runtime_dir() -> Path:
     return runtime_dir
 
 
+def get_auth_mode() -> str:
+    return (os.getenv("WEIQ_AUTH_MODE", "per_task").strip().lower() or "per_task")
+
+
+def get_auth_session_ttl_seconds() -> int:
+    raw = os.getenv("WEIQ_AUTH_SESSION_TTL_SECONDS", "").strip()
+    if raw.isdigit():
+        return max(int(raw), 60)
+    return 600
+
+
+def keep_auth_state_for_debug() -> bool:
+    return os.getenv("WEIQ_KEEP_AUTH_STATE_FOR_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_auth_state_dir() -> Path:
+    raw = os.getenv("WEIQ_AUTH_STATE_DIR", "").strip()
+    base_dir = Path(raw or (get_runtime_dir() / "auth_sessions")).expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (Path.cwd() / base_dir).resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+
+def get_task_runtime_dir(task_id: str) -> Path:
+    target = get_runtime_dir() / "tasks" / task_id
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def get_auth_session_dir(session_id: str) -> Path:
+    target = get_auth_state_dir() / session_id
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def build_auth_session_paths(session_id: str) -> dict[str, str]:
+    session_dir = get_auth_session_dir(session_id)
+    return {
+        "session_dir": str(session_dir.resolve()),
+        "state_storage": str((session_dir / "storage_state.json").resolve()),
+        "preview_image_path": str((session_dir / "preview.png").resolve()),
+        "meta_path": str((session_dir / "meta.json").resolve()),
+    }
+
+
 def ensure_single_worker_mode() -> None:
+    if get_auth_mode() != "per_task":
+        raise RuntimeError("当前 WEIQ API 仅支持 WEIQ_AUTH_MODE=per_task")
     for env_name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
         raw = os.getenv(env_name, "").strip()
         if raw.isdigit() and int(raw) > 1:
@@ -228,20 +279,36 @@ def init_db() -> None:
                     status TEXT NOT NULL,
                     login_url TEXT,
                     qr_image_base64 TEXT,
+                    state_storage TEXT,
+                    preview_image_path TEXT,
                     message TEXT,
                     expires_at TEXT,
+                    consumed_at TEXT,
+                    expired_at TEXT,
+                    cleanup_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
             task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            auth_cols = {row["name"] for row in conn.execute("PRAGMA table_info(auth_sessions)").fetchall()}
             if "login_session_id" not in task_cols:
                 conn.execute("ALTER TABLE tasks ADD COLUMN login_session_id TEXT")
             if "accepted_at" not in task_cols:
                 conn.execute("ALTER TABLE tasks ADD COLUMN accepted_at TEXT")
             if "picked_up_at" not in task_cols:
                 conn.execute("ALTER TABLE tasks ADD COLUMN picked_up_at TEXT")
+            if "state_storage" not in auth_cols:
+                conn.execute("ALTER TABLE auth_sessions ADD COLUMN state_storage TEXT")
+            if "preview_image_path" not in auth_cols:
+                conn.execute("ALTER TABLE auth_sessions ADD COLUMN preview_image_path TEXT")
+            if "consumed_at" not in auth_cols:
+                conn.execute("ALTER TABLE auth_sessions ADD COLUMN consumed_at TEXT")
+            if "expired_at" not in auth_cols:
+                conn.execute("ALTER TABLE auth_sessions ADD COLUMN expired_at TEXT")
+            if "cleanup_at" not in auth_cols:
+                conn.execute("ALTER TABLE auth_sessions ADD COLUMN cleanup_at TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_tasks_login_session_id ON tasks(login_session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_task_id ON auth_sessions(task_id)")
             conn.commit()
@@ -308,8 +375,9 @@ def upsert_auth_session(session_id: str, updates: dict[str, Any]) -> None:
         execute(
             """
             INSERT INTO auth_sessions (
-                session_id, task_id, status, login_url, qr_image_base64, message, expires_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id, task_id, status, login_url, qr_image_base64, state_storage, preview_image_path,
+                message, expires_at, consumed_at, expired_at, cleanup_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -317,8 +385,13 @@ def upsert_auth_session(session_id: str, updates: dict[str, Any]) -> None:
                 updates.get("status", "pending"),
                 updates.get("login_url"),
                 updates.get("qr_image_base64"),
+                updates.get("state_storage"),
+                updates.get("preview_image_path"),
                 updates.get("message"),
                 updates.get("expires_at"),
+                updates.get("consumed_at"),
+                updates.get("expired_at"),
+                updates.get("cleanup_at"),
                 updates.get("created_at", now_iso()),
                 updates.get("updated_at", now_iso()),
             ),
@@ -341,9 +414,96 @@ def fetch_auth_session(session_id: str) -> Optional[dict[str, Any]]:
     return fetch_one("SELECT * FROM auth_sessions WHERE session_id = ?", (session_id,))
 
 
+def is_auth_session_expired(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    expires_at = parse_iso(str(row.get("expires_at") or ""))
+    return expires_at is not None and expires_at <= datetime.now()
+
+
+def write_auth_session_meta(session_id: str, payload: dict[str, Any]) -> None:
+    meta_path = Path(build_auth_session_paths(session_id)["meta_path"])
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def capture_login_preview(session_id: str, page) -> tuple[str | None, str | None]:
+    try:
+        image_bytes = page.screenshot(type="png", full_page=False)
+    except Exception:
+        return None, None
+    paths = build_auth_session_paths(session_id)
+    preview_path = Path(paths["preview_image_path"])
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(image_bytes)
+    return str(preview_path.resolve()), base64.b64encode(image_bytes).decode("utf-8")
+
+
+def cleanup_auth_session_directory(session_id: str) -> None:
+    if keep_auth_state_for_debug():
+        return
+    session_dir = get_auth_state_dir() / session_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def expire_auth_session(session_id: str, *, message: str | None = None) -> dict[str, Any]:
+    row = fetch_auth_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    unregister_active_session(session_id)
+    now = now_iso()
+    updates = {
+        "status": "expired",
+        "message": message or "本次临时登录会话已过期，请重新创建。",
+        "expired_at": now,
+        "expires_at": now,
+    }
+    if not keep_auth_state_for_debug():
+        cleanup_auth_session_directory(session_id)
+        updates["cleanup_at"] = now
+    upsert_auth_session(session_id, updates)
+    refreshed = fetch_auth_session(session_id)
+    assert refreshed is not None
+    return refreshed
+
+
+def mark_auth_session_cleaned(session_id: str, *, status: str, message: str) -> None:
+    now = now_iso()
+    updates: dict[str, Any] = {
+        "status": status,
+        "message": message,
+        "consumed_at": now if status == "consumed" else None,
+        "expired_at": now if status == "expired" else None,
+    }
+    unregister_active_session(session_id)
+    if not keep_auth_state_for_debug():
+        cleanup_auth_session_directory(session_id)
+        updates["cleanup_at"] = now
+    upsert_auth_session(session_id, updates)
+
+
+def finalize_task_auth_session(task_id: str, task_status: str) -> None:
+    task = fetch_one("SELECT login_session_id FROM tasks WHERE task_id = ?", (task_id,))
+    session_id = str(task.get("login_session_id") or "").strip() if task else ""
+    if not session_id:
+        return
+    row = fetch_auth_session(session_id)
+    if row is None:
+        return
+    if task_status == TaskStatus.CANCELLED:
+        mark_auth_session_cleaned(session_id, status="expired", message="本次临时登录态已清理")
+        return
+    status = "consumed" if str(row.get("status") or "") == "authenticated" else "expired"
+    mark_auth_session_cleaned(session_id, status=status, message="本次临时登录态已清理")
+
+
 def materialize_task_request(payload: CreateTaskRequest) -> dict[str, Any]:
     runtime_dir = get_runtime_dir()
     task_key = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+    task_runtime_dir = get_task_runtime_dir(task_key)
+    progress_state = str((task_runtime_dir / "crawl_progress.json").resolve())
+    placeholder_auth_state = str((task_runtime_dir / "task_auth_placeholder.json").resolve())
 
     if payload.accounts:
         accounts = []
@@ -367,8 +527,8 @@ def materialize_task_request(payload: CreateTaskRequest) -> dict[str, Any]:
             "input_excel": str(input_excel.resolve()),
             "output_excel": f"weiq_results_{task_key}.xlsx",
             "output_dir": str(output_dir.resolve()),
-            "state_json": str((runtime_dir / "state.json").resolve()),
-            "state_storage": str((runtime_dir / "crawl_state.json").resolve()),
+            "state_json": progress_state,
+            "state_storage": placeholder_auth_state,
             "headless": payload.headless if payload.headless is not None else True,
             "cooldown_every": payload.cooldown_every,
             "cooldown_seconds": payload.cooldown_seconds,
@@ -382,8 +542,8 @@ def materialize_task_request(payload: CreateTaskRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="缺少 input_excel，或请改用 accounts JSON 模式")
     output_dir = str(payload.output_dir or runtime_dir).strip() or str(runtime_dir)
     output_excel = str(payload.output_excel or f"weiq_results_{task_key}.xlsx").strip()
-    state_json = str(payload.state_json or (runtime_dir / "state.json")).strip()
-    state_storage = str(payload.state_storage or (runtime_dir / "crawl_state.json")).strip()
+    state_json = str(payload.state_json or progress_state).strip()
+    state_storage = str(payload.state_storage or placeholder_auth_state).strip()
     return {
         "input_excel": input_excel,
         "output_excel": output_excel,
@@ -435,13 +595,13 @@ def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
     worker_alive = bool(WORKER_THREAD and WORKER_THREAD.is_alive())
     needs_login = bool(
         status == TaskStatus.BLOCKED_AUTH
-        or auth_session_status in {"pending", "waiting_credentials", "waiting_code", "logging_in"}
+        or auth_session_status in AUTH_WAITING_STATUSES
     )
     return {
         **row,
         "status_zh": STATUS_ZH.get(status, status),
         "error_message_zh": error_message_zh,
-        "auth_waiting": status == TaskStatus.BLOCKED_AUTH,
+        "auth_waiting": needs_login,
         "export_file": export_file,
         "accepted_at": accepted_at,
         "picked_up_at": picked_up_at,
@@ -518,32 +678,36 @@ def _build_eager_auth_session_state(
     *,
     session_id: str,
     task_id: str | None,
-    state_json: str,
+    state_storage: str,
     headless: bool,
     login_url: str = "https://www.weiq.com/",
 ) -> dict[str, Any]:
     playwright_ctx = sync_playwright().start()
-    browser, context, page = init_browser(playwright_ctx, state_json, headless)
+    browser, context, page = init_browser(playwright_ctx, state_storage, headless)
     try:
         page.goto(login_url, timeout=45000, wait_until="domcontentloaded")
     except Exception:
         pass
 
-    is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_json)
+    preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+    is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_storage)
     if is_authenticated:
         try:
-            context.storage_state(path=state_json)
+            context.storage_state(path=state_storage)
         except Exception:
             pass
         row = {
             "task_id": task_id,
             "status": "authenticated",
             "login_url": page.url or login_url,
+            "state_storage": state_storage,
+            "preview_image_path": preview_image_path,
             "qr_image_base64": None,
-            "message": "已检测到可用的 WEIQ 登录态，任务可直接继续。",
-            "expires_at": expiry_iso(30),
+            "message": "本次抓取临时 WEIQ 登录成功",
+            "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
         }
         upsert_auth_session(session_id, row)
+        write_auth_session_meta(session_id, {"session_id": session_id, "task_id": task_id, "state_storage": state_storage})
         _close_active_session_runtime({"browser": browser, "playwright": playwright_ctx})
         return fetch_auth_session(session_id) or row
 
@@ -552,17 +716,20 @@ def _build_eager_auth_session_state(
         "task_id": task_id,
         "status": status_text,
         "login_url": page.url or login_url,
-        "qr_image_base64": capture_login_screen_base64(page),
-        "message": pending_message or message,
-        "expires_at": expiry_iso(),
+        "state_storage": state_storage,
+        "preview_image_path": preview_image_path,
+        "qr_image_base64": preview_base64,
+        "message": pending_message or message or "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+        "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
     }
     upsert_auth_session(session_id, row)
+    write_auth_session_meta(session_id, {"session_id": session_id, "task_id": task_id, "state_storage": state_storage})
     register_active_session(
         session_id,
         task_id=task_id or "",
         page=page,
         context=context,
-        state_json=state_json,
+        state_storage=state_storage,
         login_url=page.url or login_url,
         browser=browser,
         playwright=playwright_ctx,
@@ -703,8 +870,104 @@ def resolve_auth_completion(page, state_json: str) -> tuple[bool, str, str | Non
     if needs_auth:
         return False, reason_code, None
     if not has_usable_storage_state(state_json):
-        return False, ErrorCode.AUTH_REQUIRED, "尚未检测到有效的 WEIQ 登录态，请先完成登录后再继续抓取。"
+        return False, ErrorCode.AUTH_REQUIRED, "本次任务尚未获得服务器端 WEIQ 登录态。本机 Chrome 登录不会同步到服务器。"
     return True, ErrorCode.NONE, None
+
+
+def _block_task_for_login(task_id: str, session_id: str, reason_code: str, message: str | None = None) -> None:
+    if not task_id:
+        return
+    upsert_task_event(
+        task_id,
+        {
+            "login_session_id": session_id,
+            "status": TaskStatus.BLOCKED_AUTH,
+            "blocked_reason": reason_code,
+            "message": message or "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息",
+        },
+    )
+
+
+def _resume_task_if_authenticated(task_id: str, session_id: str) -> None:
+    if not task_id:
+        return
+    task_row = fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
+    if task_row is None:
+        return
+    current_status = str(task_row.get("status") or TaskStatus.PENDING)
+    if current_status not in {TaskStatus.BLOCKED_AUTH, TaskStatus.PENDING, TaskStatus.RUNNING}:
+        return
+    upsert_task_event(
+        task_id,
+        {
+            "login_session_id": session_id,
+            "status": TaskStatus.PENDING,
+            "blocked_reason": None,
+            "message": "已获取本次任务临时登录态，抓取将继续",
+            "cancel_requested": 0,
+        },
+    )
+    enqueue_task(task_id)
+
+
+def ensure_auth_session_runtime(session_id: str) -> dict[str, Any]:
+    row = fetch_auth_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(row):
+        row = expire_auth_session(session_id)
+        return row
+    with ACTIVE_AUTH_LOCK:
+        session = ACTIVE_AUTH_SESSIONS.get(session_id)
+    if session is not None:
+        return row
+
+    state_storage = str(row.get("state_storage") or build_auth_session_paths(session_id)["state_storage"]).strip()
+    login_url = str(row.get("login_url") or "https://www.weiq.com/").strip() or "https://www.weiq.com/"
+    task_id = str(row.get("task_id") or "").strip()
+    task = fetch_one("SELECT headless FROM tasks WHERE task_id = ?", (task_id,)) if task_id else None
+    headless = bool(task.get("headless")) if task else True
+    playwright_ctx = sync_playwright().start()
+    browser, context, page = init_browser(playwright_ctx, state_storage, headless)
+    try:
+        page.goto(login_url, timeout=45000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+    upsert_auth_session(
+        session_id,
+        {
+            "task_id": task_id or row.get("task_id"),
+            "login_url": page.url or login_url,
+            "state_storage": state_storage,
+            "preview_image_path": preview_image_path,
+            "qr_image_base64": preview_base64,
+            "message": row.get("message") or "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+            "expires_at": row.get("expires_at") or expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    write_auth_session_meta(
+        session_id,
+        {
+            "session_id": session_id,
+            "task_id": task_id or None,
+            "state_storage": state_storage,
+            "login_url": page.url or login_url,
+        },
+    )
+    register_active_session(
+        session_id,
+        task_id=task_id,
+        page=page,
+        context=context,
+        state_storage=state_storage,
+        login_url=page.url or login_url,
+        browser=browser,
+        playwright=playwright_ctx,
+    )
+    refreshed = fetch_auth_session(session_id)
+    assert refreshed is not None
+    return refreshed
 
 
 def sanitize_account_text(value: str | None) -> str:
@@ -712,6 +975,16 @@ def sanitize_account_text(value: str | None) -> str:
 
 
 def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> dict[str, Any]:
+    session_row = fetch_auth_session(session_id)
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(session_row):
+        session_row = expire_auth_session(session_id)
+
+    if session_row.get("status") == "expired":
+        raise HTTPException(status_code=409, detail="本次临时登录会话已过期，请重新创建")
+
+    ensure_auth_session_runtime(session_id)
     with ACTIVE_AUTH_LOCK:
         session = ACTIVE_AUTH_SESSIONS.get(session_id)
     if session is None:
@@ -719,7 +992,7 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
 
     page = session["page"]
     context = session["context"]
-    state_json = session["state_json"]
+    state_storage = session["state_storage"]
     task_id = str(session["task_id"])
     login_type = (payload.login_type or "password").strip().lower()
     action = (payload.action or "submit").strip().lower()
@@ -735,15 +1008,17 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             if not fill_first_visible(targets, USERNAME_SELECTORS, phone):
                 raise HTTPException(status_code=422, detail="当前 WEIQ 登录页未切换到手机号验证码模式，请改用账号密码登录，或先切换到手机验证码登录后重试")
             if action == "send_code":
+                preview_image_path, preview_base64 = capture_login_preview(session_id, page)
                 if not click_first_text(targets, SEND_CODE_TEXTS):
                     raise HTTPException(status_code=422, detail="未找到发送验证码按钮，请检查当前 WEIQ 登录页")
                 time.sleep(1)
                 row = {
                     "status": "waiting_code",
                     "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
-                    "qr_image_base64": capture_login_screen_base64(page),
+                    "preview_image_path": preview_image_path,
+                    "qr_image_base64": preview_base64,
                     "message": "验证码已尝试发送，请输入收到的短信验证码后继续。",
-                    "expires_at": expiry_iso(),
+                    "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
                 }
                 upsert_auth_session(session_id, row)
                 return fetch_auth_session(session_id) or row
@@ -763,14 +1038,16 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             if not fill_first_visible(targets, PASSWORD_SELECTORS, password):
                 raise HTTPException(status_code=422, detail="未找到密码输入框，请检查当前 WEIQ 登录页")
 
+        preview_image_path, preview_base64 = capture_login_preview(session_id, page)
         upsert_auth_session(
             session_id,
             {
                 "status": "logging_in",
                 "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
-                "qr_image_base64": capture_login_screen_base64(page),
+                "preview_image_path": preview_image_path,
+                "qr_image_base64": preview_base64,
                 "message": "已提交登录信息，正在等待 WEIQ 返回结果。",
-                "expires_at": expiry_iso(),
+                "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
             },
         )
 
@@ -778,10 +1055,10 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
             raise HTTPException(status_code=422, detail="未找到登录提交按钮，请检查当前 WEIQ 登录页")
         wait_for_page_settle(page)
 
-        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_json)
+        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_storage)
         if is_authenticated:
             try:
-                context.storage_state(path=state_json)
+                context.storage_state(path=state_storage)
             except Exception:
                 pass
             upsert_auth_session(
@@ -789,42 +1066,31 @@ def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> d
                 {
                     "status": "authenticated",
                     "login_url": page.url,
+                    "preview_image_path": None,
                     "qr_image_base64": None,
-                    "message": "登录成功，抓取任务会自动继续。",
-                    "expires_at": expiry_iso(30),
-                },
-            )
-            upsert_task_event(
-                task_id,
-                {
-                    "status": TaskStatus.RUNNING,
-                    "blocked_reason": None,
-                    "message": "检测到登录成功，任务继续运行",
+                    "message": "本次抓取临时 WEIQ 登录成功",
+                    "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
                 },
             )
             unregister_active_session(session_id)
+            _resume_task_if_authenticated(task_id, session_id)
             row = fetch_auth_session(session_id)
             assert row is not None
             return row
 
-        status_text, message = infer_auth_session_state(page, reason_code)
-        row = {
-            "status": status_text,
-            "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
-            "qr_image_base64": capture_login_screen_base64(page),
-            "message": pending_message or message,
-            "expires_at": expiry_iso(),
-        }
-        upsert_auth_session(session_id, row)
-        upsert_task_event(
-            task_id,
-            {
-                "status": TaskStatus.BLOCKED_AUTH,
-                "blocked_reason": reason_code,
-                "message": pending_message or message,
-            },
-        )
-        return fetch_auth_session(session_id) or row
+    status_text, message = infer_auth_session_state(page, reason_code)
+    preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+    row = {
+        "status": status_text,
+        "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
+        "preview_image_path": preview_image_path,
+        "qr_image_base64": preview_base64,
+        "message": pending_message or message,
+        "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+    }
+    upsert_auth_session(session_id, row)
+    _block_task_for_login(task_id, session_id, reason_code, pending_message or message)
+    return fetch_auth_session(session_id) or row
 
 
 def register_active_session(
@@ -833,7 +1099,7 @@ def register_active_session(
     task_id: str,
     page,
     context,
-    state_json: str,
+    state_storage: str,
     login_url: str,
     browser=None,
     playwright=None,
@@ -844,7 +1110,7 @@ def register_active_session(
             "task_id": task_id,
             "page": page,
             "context": context,
-            "state_json": state_json,
+            "state_storage": state_storage,
             "login_url": login_url,
             "browser": browser,
             "playwright": playwright,
@@ -881,26 +1147,32 @@ def ensure_auth_session_for_task(task_id: str, reason_code: str, page_url: str, 
     if not session_id:
         session_id = uuid4().hex
         upsert_task_event(task_id, {"login_session_id": session_id})
+    paths = build_auth_session_paths(session_id)
     status_text, message = infer_auth_session_state(page, reason_code)
-    qr_image_base64 = capture_login_screen_base64(page)
+    preview_image_path, qr_image_base64 = capture_login_preview(session_id, page)
     upsert_auth_session(
         session_id,
         {
             "task_id": task_id,
             "status": status_text,
             "login_url": page_url or "https://www.weiq.com/",
+            "state_storage": paths["state_storage"],
+            "preview_image_path": preview_image_path,
             "qr_image_base64": qr_image_base64,
-            "message": message,
-            "expires_at": expiry_iso(),
+            "message": message or "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息",
+            "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
         },
     )
-    register_active_session(
+    unregister_active_session(session_id)
+    write_auth_session_meta(
         session_id,
-        task_id=task_id,
-        page=page,
-        context=context,
-        state_json=state_json,
-        login_url=page_url or "https://www.weiq.com/",
+        {
+            "session_id": session_id,
+            "task_id": task_id,
+            "state_storage": paths["state_storage"],
+            "source_page_url": page_url or "https://www.weiq.com/",
+            "captured_from_runtime": True,
+        },
     )
     return session_id
 
@@ -912,12 +1184,12 @@ def inspect_active_auth_session(session_id: str) -> Optional[dict[str, Any]]:
         return None
     page = session["page"]
     context = session["context"]
-    state_json = session["state_json"]
+    state_storage = session["state_storage"]
     with session["lock"]:
-        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_json)
+        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_storage)
         if is_authenticated:
             try:
-                context.storage_state(path=state_json)
+                context.storage_state(path=state_storage)
             except Exception:
                 pass
             upsert_auth_session(
@@ -925,90 +1197,29 @@ def inspect_active_auth_session(session_id: str) -> Optional[dict[str, Any]]:
                 {
                     "status": "authenticated",
                     "login_url": page.url,
+                    "preview_image_path": None,
                     "qr_image_base64": None,
-                    "message": "登录成功，任务将自动继续",
-                    "expires_at": expiry_iso(30),
-                },
-            )
-            upsert_task_event(
-                str(session["task_id"]),
-                {
-                    "status": TaskStatus.RUNNING,
-                    "blocked_reason": None,
-                    "message": "检测到登录成功，任务继续运行",
+                    "message": "本次抓取临时 WEIQ 登录成功",
+                    "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
                 },
             )
             unregister_active_session(session_id)
+            _resume_task_if_authenticated(str(session["task_id"]), session_id)
         else:
             status_text, message = infer_auth_session_state(page, reason_code)
+            preview_image_path, preview_base64 = capture_login_preview(session_id, page)
             upsert_auth_session(
                 session_id,
                 {
                     "status": status_text,
                     "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
-                    "qr_image_base64": capture_login_screen_base64(page),
+                    "preview_image_path": preview_image_path,
+                    "qr_image_base64": preview_base64,
                     "message": pending_message or message,
-                    "expires_at": expiry_iso(),
+                    "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
                 },
             )
     return fetch_auth_session(session_id)
-
-
-def wait_for_auth_or_cancel(task_id: str, session_id: str, page, context, state_json: str) -> bool:
-    while True:
-        row = fetch_one(
-            "SELECT cancel_requested, resume_requested FROM tasks WHERE task_id = ?",
-            (task_id,),
-        )
-        if not row:
-            unregister_active_session(session_id)
-            return False
-        if row["cancel_requested"]:
-            upsert_auth_session(session_id, {"status": "failed", "message": "任务已取消"})
-            unregister_active_session(session_id)
-            return False
-
-        session_row = inspect_active_auth_session(session_id)
-        if session_row and session_row.get("status") == "authenticated":
-            return True
-
-        if row["resume_requested"]:
-            if has_usable_storage_state(state_json):
-                try:
-                    context.storage_state(path=state_json)
-                except Exception:
-                    pass
-                upsert_task_event(
-                    task_id,
-                    {
-                        "resume_requested": 0,
-                        "status": TaskStatus.RUNNING,
-                        "blocked_reason": None,
-                        "message": "已收到继续请求，恢复运行",
-                    },
-                )
-                upsert_auth_session(session_id, {"status": "authenticated", "message": "已手动请求继续"})
-                unregister_active_session(session_id)
-                return True
-
-            upsert_task_event(
-                task_id,
-                {
-                    "resume_requested": 0,
-                    "status": TaskStatus.BLOCKED_AUTH,
-                    "blocked_reason": ErrorCode.AUTH_REQUIRED,
-                    "message": "尚未检测到有效的 WEIQ 登录态，请先完成登录后再继续。",
-                },
-            )
-            upsert_auth_session(
-                session_id,
-                {
-                    "status": "waiting_credentials",
-                    "message": "尚未检测到有效的 WEIQ 登录态，请先完成登录后再继续。",
-                    "expires_at": expiry_iso(),
-                },
-            )
-        time.sleep(1)
 
 
 def build_hooks(task_id: str) -> CrawlHooks:
@@ -1057,16 +1268,8 @@ def build_hooks(task_id: str) -> CrawlHooks:
 
     def on_auth_required(reason_code: str, page_url: str, page, context, state_json: str) -> bool:
         session_id = ensure_auth_session_for_task(task_id, reason_code, page_url, page, context, state_json)
-        upsert_task_event(
-            task_id,
-            {
-                "status": TaskStatus.BLOCKED_AUTH,
-                "blocked_reason": reason_code,
-                "message": f"等待处理登录风控: {page_url}",
-                "login_session_id": session_id,
-            },
-        )
-        return wait_for_auth_or_cancel(task_id, session_id, page, context, state_json)
+        _block_task_for_login(task_id, session_id, reason_code, f"等待处理登录风控: {page_url}")
+        return False
 
     return CrawlHooks(on_event=on_event, should_stop=should_stop, on_auth_required=on_auth_required)
 
@@ -1088,6 +1291,27 @@ def run_task(task_id: str) -> None:
                 "message": "任务在启动前已取消",
             },
         )
+        finalize_task_auth_session(task_id, TaskStatus.CANCELLED)
+        return
+
+    session_id = str(row.get("login_session_id") or "").strip()
+    auth_session = fetch_auth_session(session_id) if session_id else None
+    if not session_id:
+        created = create_auth_session(AuthSessionCreateRequest(task_id=task_id, eager=True))
+        session_id = created.session_id
+        auth_session = fetch_auth_session(session_id)
+        row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,)) or row
+    elif auth_session and is_auth_session_expired(auth_session):
+        auth_session = expire_auth_session(session_id)
+
+    auth_state_storage = str(auth_session.get("state_storage") or "").strip() if auth_session else ""
+    auth_status = str(auth_session.get("status") or "").strip() if auth_session else ""
+    if auth_status != "authenticated" or not auth_state_storage or not has_usable_storage_state(auth_state_storage):
+        if auth_session is not None:
+            waiting_message = str(auth_session.get("message") or "").strip() or "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息"
+        else:
+            waiting_message = "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息"
+        _block_task_for_login(task_id, session_id, ErrorCode.AUTH_REQUIRED, waiting_message)
         return
 
     config = CrawlConfig(
@@ -1095,7 +1319,7 @@ def run_task(task_id: str) -> None:
         output_excel=row["output_excel"],
         output_dir=row["output_dir"],
         state_json=row["state_json"],
-        state_storage=row["state_storage"],
+        state_storage=auth_state_storage,
         headless=bool(row["headless"]),
         cooldown_every=row["cooldown_every"],
         cooldown_seconds=row["cooldown_seconds"],
@@ -1141,6 +1365,8 @@ def run_task(task_id: str) -> None:
                 ),
             },
         )
+        if result.status in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            finalize_task_auth_session(task_id, result.status)
     except Exception as exc:
         upsert_task_event(
             task_id,
@@ -1151,6 +1377,7 @@ def run_task(task_id: str) -> None:
                 "message": f"任务异常崩溃: {exc}",
             },
         )
+        finalize_task_auth_session(task_id, TaskStatus.FAILED)
 
 
 def worker_loop() -> None:
@@ -1319,8 +1546,7 @@ def cancel_task(task_id: str) -> TaskControlResponse:
 
     upsert_task_event(task_id, {"cancel_requested": 1, "message": "已请求取消任务"})
     if row.get("login_session_id"):
-        upsert_auth_session(str(row["login_session_id"]), {"status": "failed", "message": "任务已取消"})
-        unregister_active_session(str(row["login_session_id"]))
+        mark_auth_session_cleaned(str(row["login_session_id"]), status="expired", message="本次临时登录态已清理")
     return TaskControlResponse(task_id=task_id, status=TaskStatus.CANCELLED, message="取消请求已发送")
 
 
@@ -1367,24 +1593,33 @@ def requeue_task(task_id: str) -> TaskControlResponse:
 def create_auth_session(payload: AuthSessionCreateRequest | None = None) -> AuthSessionResponse:
     payload = payload or AuthSessionCreateRequest()
     session_id = uuid4().hex
-    state_json = str((get_runtime_dir() / "state.json").resolve())
     headless = True
     task_id = payload.task_id
+    paths = build_auth_session_paths(session_id)
     if task_id:
-        task = fetch_one("SELECT task_id, state_json, headless FROM tasks WHERE task_id = ?", (task_id,))
+        task = fetch_one("SELECT task_id, headless FROM tasks WHERE task_id = ?", (task_id,))
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
-        state_json = str(task.get("state_json") or state_json)
         headless = bool(task.get("headless"))
     upsert_auth_session(
         session_id,
         {
             "task_id": task_id,
-            "status": "pending",
+            "status": "waiting_credentials",
             "login_url": "https://www.weiq.com/",
+            "state_storage": paths["state_storage"],
+            "preview_image_path": None,
             "qr_image_base64": None,
-            "message": "登录会话已创建，等待绑定抓取任务" if not payload.eager else "登录会话已创建，正在准备 WEIQ 登录页",
-            "expires_at": expiry_iso(),
+            "message": "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+            "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    write_auth_session_meta(
+        session_id,
+        {
+            "session_id": session_id,
+            "task_id": task_id,
+            "state_storage": paths["state_storage"],
         },
     )
     if task_id:
@@ -1393,7 +1628,7 @@ def create_auth_session(payload: AuthSessionCreateRequest | None = None) -> Auth
         row = _build_eager_auth_session_state(
             session_id=session_id,
             task_id=task_id,
-            state_json=state_json,
+            state_storage=paths["state_storage"],
             headless=headless,
         )
         return build_auth_session_response(row)
@@ -1407,55 +1642,42 @@ def get_auth_session(session_id: str) -> AuthSessionResponse:
     row = inspect_active_auth_session(session_id) or fetch_auth_session(session_id)
     if not row:
         raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(row):
+        row = expire_auth_session(session_id)
     return build_auth_session_response(row)
 
 
 @app.post("/v1/auth/session/{session_id}/attach-task", response_model=AuthSessionResponse)
 def attach_auth_session_to_task(session_id: str, payload: AuthAttachTaskRequest) -> AuthSessionResponse:
-    task = fetch_one("SELECT task_id, login_session_id, status, state_json, headless FROM tasks WHERE task_id = ?", (payload.task_id,))
+    task = fetch_one("SELECT task_id, login_session_id, status, headless FROM tasks WHERE task_id = ?", (payload.task_id,))
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
     existing = fetch_auth_session(session_id)
     if existing is None:
+        paths = build_auth_session_paths(session_id)
         upsert_auth_session(
             session_id,
             {
                 "task_id": payload.task_id,
-                "status": "pending",
+                "status": "waiting_credentials",
                 "login_url": "https://www.weiq.com/",
+                "state_storage": paths["state_storage"],
                 "qr_image_base64": None,
-                "message": "登录会话已绑定任务",
-                "expires_at": expiry_iso(),
+                "message": "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+                "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
             },
         )
 
-    previous_session_id = str(task.get("login_session_id") or "").strip()
-    if previous_session_id:
-        migrate_active_session(previous_session_id, session_id, payload.task_id)
-        previous_row = fetch_auth_session(previous_session_id)
-        if previous_row:
-            upsert_auth_session(
-                session_id,
-                {
-                    "task_id": payload.task_id,
-                    "status": previous_row.get("status", "waiting_credentials"),
-                    "login_url": previous_row.get("login_url"),
-                    "qr_image_base64": previous_row.get("qr_image_base64"),
-                    "message": previous_row.get("message"),
-                    "expires_at": previous_row.get("expires_at"),
-                },
-            )
-
     upsert_task_event(payload.task_id, {"login_session_id": session_id})
-    upsert_auth_session(session_id, {"task_id": payload.task_id, "message": "登录会话已绑定任务"})
+    upsert_auth_session(session_id, {"task_id": payload.task_id, "message": "本次登录会话已绑定当前抓取任务"})
     if session_id not in ACTIVE_AUTH_SESSIONS:
         session_row = fetch_auth_session(session_id)
-        if session_row and str(session_row.get("status") or "") in {"pending", "waiting_credentials", "waiting_code", "logging_in"}:
+        if session_row and str(session_row.get("status") or "") in AUTH_WAITING_STATUSES:
             _build_eager_auth_session_state(
                 session_id=session_id,
                 task_id=payload.task_id,
-                state_json=str(task.get("state_json") or (get_runtime_dir() / "state.json")),
+                state_storage=str(session_row.get("state_storage") or build_auth_session_paths(session_id)["state_storage"]),
                 headless=bool(task.get("headless")),
             )
     return get_auth_session(session_id)
@@ -1464,6 +1686,44 @@ def attach_auth_session_to_task(session_id: str, payload: AuthAttachTaskRequest)
 @app.post("/v1/auth/session/{session_id}/submit", response_model=AuthSessionResponse)
 def submit_auth_session(session_id: str, payload: AuthSubmitRequest) -> AuthSessionResponse:
     row = submit_auth_session_inputs(session_id, payload)
+    return build_auth_session_response(row)
+
+
+@app.post("/v1/auth/session/{session_id}/check", response_model=AuthSessionResponse)
+def check_auth_session(session_id: str) -> AuthSessionResponse:
+    row = inspect_active_auth_session(session_id) or fetch_auth_session(session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(row):
+        row = expire_auth_session(session_id)
+        return build_auth_session_response(row)
+
+    state_storage = str(row.get("state_storage") or "").strip()
+    if state_storage and has_usable_storage_state(state_storage):
+        upsert_auth_session(
+            session_id,
+            {
+                "status": "authenticated",
+                "message": "本次抓取临时 WEIQ 登录成功",
+                "preview_image_path": None,
+                "qr_image_base64": None,
+                "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
+            },
+        )
+        row = fetch_auth_session(session_id) or row
+        _resume_task_if_authenticated(str(row.get("task_id") or ""), session_id)
+        return build_auth_session_response(row)
+
+    waiting_message = "本次任务尚未获得服务器端 WEIQ 登录态。本机 Chrome 登录不会同步到服务器。"
+    upsert_auth_session(
+        session_id,
+        {
+            "status": "waiting_credentials",
+            "message": waiting_message,
+            "expires_at": row.get("expires_at") or expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    row = fetch_auth_session(session_id) or row
     return build_auth_session_response(row)
 
 
