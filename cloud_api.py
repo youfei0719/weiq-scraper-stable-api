@@ -374,7 +374,7 @@ def _submit_auth_session_with_browser(session: dict[str, Any], payload: dict[str
                         return "failed", _build_login_debug_message(page, "找不到发送验证码按钮")
                     send_btn.click()
                     return "waiting_code", "验证码已发送，请提交验证码"
-                code = payload.get("code")
+                code = payload.get("code") or payload.get("verification_code")
                 if not code:
                     return "waiting_code", "等待验证码"
                 code_input = _find_first(page, ["input[placeholder*='验证码']", "input[name='code']", "input[name='sms_code']", "input[inputmode='numeric']"])
@@ -426,6 +426,7 @@ class SubmitAuthSessionRequest(BaseModel):
     password: str | None = None
     phone: str | None = None
     code: str | None = None
+    verification_code: str | None = None
 
 
 class CrawlTaskRequest(BaseModel):
