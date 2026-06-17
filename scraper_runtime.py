@@ -11,6 +11,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import pandas as pd
 from PIL import Image
@@ -31,6 +32,40 @@ VERIFY_FILL_MAP = {
 }
 
 global_request_count = 0
+
+
+@dataclass(slots=True)
+class ProxySettings:
+    server: str
+    username: str | None = None
+    password: str | None = None
+    bypass: str | None = None
+
+    def as_playwright_proxy(self) -> dict[str, str]:
+        payload = {"server": self.server}
+        if self.username:
+            payload["username"] = self.username
+        if self.password:
+            payload["password"] = self.password
+        if self.bypass:
+            payload["bypass"] = self.bypass
+        return payload
+
+    def as_httpx_proxy(self) -> str:
+        if not self.username:
+            return self.server
+        parsed = urlparse(self.server)
+        auth = self.username
+        if self.password:
+            auth = f"{auth}:{self.password}"
+        netloc = f"{auth}@{parsed.netloc}"
+        return parsed._replace(netloc=netloc).geturl()
+
+    def safe_server(self) -> str:
+        parsed = urlparse(self.server)
+        if parsed.scheme and parsed.hostname:
+            return f"{parsed.scheme}://{parsed.hostname}" if parsed.port is None else f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        return self.server
 
 
 class TaskStatus(str, Enum):
@@ -96,6 +131,34 @@ def _ensure_parent_dir(file_path: str) -> None:
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _clean_env_value(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def load_proxy_settings_from_env() -> ProxySettings | None:
+    server = _clean_env_value("WEIQ_PROXY_SERVER")
+    if not server:
+        return None
+    return ProxySettings(
+        server=server,
+        username=_clean_env_value("WEIQ_PROXY_USERNAME"),
+        password=_clean_env_value("WEIQ_PROXY_PASSWORD"),
+        bypass=_clean_env_value("WEIQ_PROXY_BYPASS"),
+    )
+
+
+def get_playwright_launch_kwargs(*, headless: bool = True) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"headless": headless}
+    proxy = load_proxy_settings_from_env()
+    if proxy:
+        kwargs["proxy"] = proxy.as_playwright_proxy()
+    return kwargs
+
+
 def has_usable_storage_state(state_file: str | None) -> bool:
     if not state_file:
         return False
@@ -130,7 +193,7 @@ def init_env(output_excel: str = OUTPUT_EXCEL):
 
 def init_browser(p: Playwright, *, headless: bool = True, state_storage: str | None = None) -> tuple[Browser, BrowserContext, Page]:
     print("[初始化] 正在启动浏览器...")
-    browser = p.chromium.launch(headless=headless)
+    browser = p.chromium.launch(**get_playwright_launch_kwargs(headless=headless))
 
     if has_usable_storage_state(state_storage):
         print(f"[初始化] 检测到凭证文件 {state_storage}，尝试以已登录状态恢复会话。")

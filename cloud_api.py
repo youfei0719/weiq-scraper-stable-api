@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import shutil
 import sqlite3
 import threading
@@ -12,12 +13,24 @@ from typing import Any
 from uuid import uuid4
 
 import pandas as pd
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-from scraper_runtime import CrawlConfig, CrawlHooks, CrawlResult, ErrorCode, TaskStatus, has_usable_storage_state, init_browser, run_crawl
+from scraper_runtime import (
+    CrawlConfig,
+    CrawlHooks,
+    CrawlResult,
+    ErrorCode,
+    TaskStatus,
+    get_playwright_launch_kwargs,
+    has_usable_storage_state,
+    init_browser,
+    load_proxy_settings_from_env,
+    run_crawl,
+)
 
 
 def _utcnow() -> datetime:
@@ -40,6 +53,196 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_browser_auth_mode(value: str | None) -> str:
+    mode = (value or "").strip().lower()
+    return mode if mode in {"per_task", "legacy_state"} else "per_task"
+
+
+def _proxy_enabled() -> bool:
+    return load_proxy_settings_from_env() is not None
+
+
+def _safe_proxy_server() -> str | None:
+    proxy = load_proxy_settings_from_env()
+    return proxy.safe_server() if proxy else None
+
+
+def _build_blocked_message() -> str:
+    return "当前服务器出口访问 WEIQ 被拦截，无法进入登录页。请更换 stable-api 运行环境、配置合规代理出口，或联系 WEIQ 放行服务器出口 IP。"
+
+
+def _extract_title_from_html(html: str) -> str | None:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    title = re.sub(r"\s+", " ", match.group(1)).strip()
+    return title or None
+
+
+def _detect_blocked_text(*, title: str | None = None, body: str | None = None) -> bool:
+    normalized_title = (title or "").strip().lower()
+    normalized_body = (body or "").strip().lower()
+    markers = [
+        "the url you requested has been blocked",
+        "url you requested has been blocked",
+    ]
+    if any(marker in normalized_title for marker in markers):
+        return True
+    return "blocked" in normalized_body or any(marker in normalized_body for marker in markers)
+
+
+def _httpx_proxy_kwargs() -> dict[str, Any]:
+    proxy = load_proxy_settings_from_env()
+    if not proxy:
+        return {"trust_env": False}
+    return {"proxy": proxy.as_httpx_proxy(), "trust_env": False}
+
+
+def _detect_title_and_blocked_from_page(page) -> tuple[str | None, bool]:
+    try:
+        title = page.title()
+    except Exception:
+        title = None
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        try:
+            body_text = page.content()
+        except Exception:
+            body_text = ""
+    return title, _detect_blocked_text(title=title, body=body_text)
+
+
+def _page_body_text(page) -> str:
+    try:
+        return page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        try:
+            return page.content()
+        except Exception:
+            return ""
+
+
+def _legacy_page_has_visible_login_form(page) -> bool:
+    try:
+        inputs = page.locator("input, textarea")
+        count = inputs.count()
+    except Exception:
+        return False
+
+    login_tokens = ("login", "passport", "password", "密码", "验证码", "手机号", "账号", "账户")
+    for index in range(min(count, 20)):
+        try:
+            locator = inputs.nth(index)
+            tag_name = (locator.evaluate("(node) => node.tagName") or "").lower()
+            input_type = (locator.get_attribute("type") or "").lower()
+            placeholder = (locator.get_attribute("placeholder") or "").lower()
+            name = (locator.get_attribute("name") or "").lower()
+            aria_label = (locator.get_attribute("aria-label") or "").lower()
+            value = " ".join([tag_name, input_type, placeholder, name, aria_label])
+        except Exception:
+            continue
+        if "password" in value:
+            return True
+        if any(token in value for token in login_tokens):
+            return True
+    return False
+
+
+def _legacy_page_status(page) -> dict[str, Any]:
+    title, blocked = _detect_title_and_blocked_from_page(page)
+    body_text = _page_body_text(page)
+    url = (page.url or "").strip()
+    normalized_body = body_text.lower()
+    normalized_url = url.lower()
+    login_like = "login" in normalized_url or "passport" in normalized_url or _legacy_page_has_visible_login_form(page)
+    return {
+        "title": title,
+        "blocked": blocked,
+        "login_like": login_like,
+        "authenticated": not blocked and not login_like,
+        "body_excerpt": body_text[:240],
+        "url": url,
+    }
+
+
+def _requests_weiq_access_probe() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "status_code": None,
+        "final_url": None,
+        "title_detected": None,
+        "blocked_detected": False,
+        "error": None,
+    }
+    try:
+        with httpx.Client(follow_redirects=True, timeout=20.0, **_httpx_proxy_kwargs()) as client:
+            response = client.get("https://www.weiq.com/")
+        title = _extract_title_from_html(response.text)
+        blocked = _detect_blocked_text(title=title, body=response.text)
+        result.update(
+            {
+                "ok": 200 <= response.status_code < 400 and not blocked,
+                "status_code": response.status_code,
+                "final_url": str(response.url),
+                "title_detected": title,
+                "blocked_detected": blocked,
+            }
+        )
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def _playwright_weiq_access_probe(runtime_dir: str) -> dict[str, Any]:
+    debug_dir = _ensure_dir(Path(runtime_dir) / "debug")
+    screenshot_path = str(debug_dir / f"weiq_access_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.png")
+    result: dict[str, Any] = {
+        "ok": False,
+        "status_code": None,
+        "final_url": None,
+        "title": None,
+        "blocked_detected": False,
+        "screenshot_path": screenshot_path,
+        "error": None,
+    }
+    try:
+        with sync_playwright() as p:
+            browser, context, page = init_browser(p, headless=True, state_storage=None)
+            try:
+                response = page.goto("https://www.weiq.com/", timeout=60000, wait_until="domcontentloaded")
+                title, blocked = _detect_title_and_blocked_from_page(page)
+                page.screenshot(path=screenshot_path, full_page=True)
+                status_code = response.status if response else None
+                result.update(
+                    {
+                        "ok": status_code is not None and 200 <= status_code < 400 and not blocked,
+                        "status_code": status_code,
+                        "final_url": page.url,
+                        "title": title,
+                        "blocked_detected": blocked,
+                    }
+                )
+            finally:
+                browser.close()
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def _detect_public_ip() -> str | None:
+    try:
+        with httpx.Client(timeout=10.0, **_httpx_proxy_kwargs()) as client:
+            response = client.get("https://api.ipify.org?format=json")
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+    ip = payload.get("ip")
+    return str(ip) if ip else None
+
+
 @dataclass(slots=True)
 class ApiSettings:
     db_path: str
@@ -47,20 +250,52 @@ class ApiSettings:
     auth_state_dir: str
     auth_session_ttl_seconds: int
     keep_auth_state_for_debug: bool
+    browser_auth_mode: str
+    legacy_state_json: str
+    legacy_headless: bool
     login_url: str
+    proxy_server: str | None
+    proxy_username: str | None
+    proxy_password: str | None
+    proxy_bypass: str | None
+
+
+@dataclass(slots=True)
+class LegacyLoginBrowserSession:
+    playwright: Any
+    browser: Any
+    context: Any
+    page: Any
+    login_url: str
+    state_json_path: str
+    headless: bool
+    opened_at: datetime
+    last_checked_at: datetime | None = None
+
+
+_legacy_login_session_lock = threading.Lock()
+_legacy_login_session: LegacyLoginBrowserSession | None = None
 
 
 def load_settings() -> ApiSettings:
     runtime_dir = os.environ.get("WEIQ_API_RUNTIME_DIR", "/opt/weiq-scraper-stable-api/runtime")
     auth_state_dir = os.environ.get("WEIQ_AUTH_STATE_DIR", str(Path(runtime_dir) / "auth_sessions"))
     db_path = os.environ.get("WEIQ_DB_PATH", "/opt/weiq-scraper-stable-api/weiq_local.db")
+    legacy_state_json = os.environ.get("WEIQ_LEGACY_STATE_JSON", str(Path(runtime_dir) / "state.json"))
     return ApiSettings(
         db_path=db_path,
         runtime_dir=runtime_dir,
         auth_state_dir=auth_state_dir,
         auth_session_ttl_seconds=int(os.environ.get("WEIQ_AUTH_SESSION_TTL_SECONDS", "600")),
         keep_auth_state_for_debug=_as_bool(os.environ.get("WEIQ_KEEP_AUTH_STATE_FOR_DEBUG"), False),
+        browser_auth_mode=_normalize_browser_auth_mode(os.environ.get("WEIQ_BROWSER_AUTH_MODE")),
+        legacy_state_json=legacy_state_json,
+        legacy_headless=_as_bool(os.environ.get("WEIQ_LEGACY_HEADLESS"), False),
         login_url=os.environ.get("WEIQ_LOGIN_URL", "https://www.weiq.com/"),
+        proxy_server=os.environ.get("WEIQ_PROXY_SERVER", "").strip() or None,
+        proxy_username=os.environ.get("WEIQ_PROXY_USERNAME", "").strip() or None,
+        proxy_password=os.environ.get("WEIQ_PROXY_PASSWORD", "").strip() or None,
+        proxy_bypass=os.environ.get("WEIQ_PROXY_BYPASS", "").strip() or None,
     )
 
 
@@ -246,6 +481,134 @@ def _cleanup_auth_session(settings: ApiSettings, session: dict[str, Any]) -> Non
         )
 
 
+def _legacy_state_path(settings: ApiSettings) -> Path:
+    return Path(settings.legacy_state_json)
+
+
+def _legacy_state_exists(settings: ApiSettings) -> bool:
+    return _legacy_state_path(settings).exists()
+
+
+def _legacy_state_usable(settings: ApiSettings) -> bool:
+    return has_usable_storage_state(settings.legacy_state_json)
+
+
+def _close_legacy_login_session() -> None:
+    global _legacy_login_session
+    with _legacy_login_session_lock:
+        session = _legacy_login_session
+        _legacy_login_session = None
+    if session is None:
+        return
+    for resource_name in ("context", "browser"):
+        resource = getattr(session, resource_name, None)
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except Exception:
+            pass
+    playwright = getattr(session, "playwright", None)
+    if playwright is not None:
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+
+
+def _get_legacy_login_session() -> LegacyLoginBrowserSession | None:
+    with _legacy_login_session_lock:
+        session = _legacy_login_session
+    if session is None:
+        return None
+    try:
+        _ = session.page.url
+        return session
+    except Exception:
+        _close_legacy_login_session()
+        return None
+
+
+def _set_legacy_login_session(session: LegacyLoginBrowserSession | None) -> None:
+    global _legacy_login_session
+    with _legacy_login_session_lock:
+        _legacy_login_session = session
+
+
+def _open_legacy_login_browser(settings: ApiSettings) -> LegacyLoginBrowserSession:
+    _close_legacy_login_session()
+    state_path = _legacy_state_path(settings)
+    _ensure_dir(state_path.parent)
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(**get_playwright_launch_kwargs(headless=settings.legacy_headless))
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto(settings.login_url, timeout=60000, wait_until="domcontentloaded")
+    session = LegacyLoginBrowserSession(
+        playwright=playwright,
+        browser=browser,
+        context=context,
+        page=page,
+        login_url=settings.login_url,
+        state_json_path=str(state_path),
+        headless=settings.legacy_headless,
+        opened_at=_utcnow(),
+    )
+    _set_legacy_login_session(session)
+    return session
+
+
+def _check_legacy_login_session(settings: ApiSettings) -> dict[str, Any]:
+    state_path = _legacy_state_path(settings)
+    session = _get_legacy_login_session()
+    state_exists = state_path.exists()
+    payload: dict[str, Any] = {
+        "authenticated": False,
+        "state_json_exists": state_exists,
+        "state_json_path": str(state_path),
+        "message": "未检测到可用的 legacy 登录浏览器",
+        "blocked": False,
+    }
+    if session is None:
+        if _legacy_state_usable(settings):
+            payload.update(
+                {
+                    "authenticated": True,
+                    "message": "已检测到可用的 legacy 登录态",
+                }
+            )
+        return payload
+
+    session.last_checked_at = _utcnow()
+    page_status = _legacy_page_status(session.page)
+    if page_status["blocked"]:
+        payload["blocked"] = True
+        payload["message"] = _build_blocked_message()
+        return payload
+
+    if page_status["login_like"]:
+        payload["message"] = "当前浏览器仍停留在 WEIQ 登录页，请先完成人工登录"
+        return payload
+
+    try:
+        _ensure_dir(state_path.parent)
+        session.context.storage_state(path=str(state_path))
+    except Exception as exc:
+        payload["message"] = f"保存 legacy 登录态失败: {exc}"
+        return payload
+
+    if _legacy_state_usable(settings):
+        payload.update(
+            {
+                "authenticated": True,
+                "message": "已保存可用的 legacy 登录态",
+            }
+        )
+    else:
+        payload["message"] = "已尝试保存 legacy 登录态，但文件不可用"
+    return payload
+
+
 def _session_status_for_check(session: dict[str, Any]) -> tuple[str, str]:
     expires_at = _parse_iso(session.get("expires_at"))
     if expires_at and expires_at <= _utcnow():
@@ -338,6 +701,10 @@ def _submit_auth_session_with_browser(session: dict[str, Any], payload: dict[str
         browser, context, page = init_browser(p, headless=True, state_storage=None)
         try:
             page.goto(settings.login_url, timeout=60000, wait_until="domcontentloaded")
+            _, blocked_detected = _detect_title_and_blocked_from_page(page)
+            if blocked_detected:
+                _save_login_failure_artifacts(page, session)
+                return "failed", _build_blocked_message()
             if login_type == "password":
                 username = payload.get("username") or payload.get("phone") or payload.get("account")
                 password = payload.get("password")
@@ -431,7 +798,7 @@ class SubmitAuthSessionRequest(BaseModel):
 
 class CrawlTaskRequest(BaseModel):
     accounts: list[AccountPayload]
-    login_session_id: str
+    login_session_id: str | None = None
     headless: bool = True
     retry_times: int = 1
     retry_backoff_seconds: int = 3
@@ -497,11 +864,26 @@ class RuntimeManager:
                 return
             if task["status"] == TaskStatus.CANCELLED.value:
                 return
-            session = _get_auth_session(conn, task["login_session_id"])
-            if session is None:
-                raise RuntimeError("登录会话不存在")
-            if not has_usable_storage_state(session.get("state_storage")):
-                raise RuntimeError("登录会话缺少有效 storage_state")
+            browser_auth_mode = self.settings.browser_auth_mode
+            session = None
+            state_storage = task.get("state_storage")
+            headless = bool(task["headless"])
+            if browser_auth_mode == "legacy_state":
+                state_storage = self.settings.legacy_state_json
+                headless = self.settings.legacy_headless
+                if not has_usable_storage_state(state_storage):
+                    raise RuntimeError("legacy 登录态缺少有效 storage_state")
+            else:
+                session_id = str(task.get("login_session_id") or "").strip()
+                if not session_id:
+                    raise RuntimeError("登录会话不存在")
+                session = _get_auth_session(conn, session_id)
+                if session is None:
+                    raise RuntimeError("登录会话不存在")
+                if not has_usable_storage_state(session.get("state_storage")):
+                    raise RuntimeError("登录会话缺少有效 storage_state")
+                state_storage = session["state_storage"]
+                headless = bool(task["headless"])
             _update_row(
                 conn,
                 "tasks",
@@ -510,12 +892,13 @@ class RuntimeManager:
                 status=TaskStatus.RUNNING.value,
                 started_at=_iso_now(),
                 message="任务开始执行",
-                state_storage=session["state_storage"],
+                state_storage=state_storage,
             )
-            conn.execute(
-                "UPDATE auth_sessions SET task_id = ?, consumed_at = ?, updated_at = ? WHERE session_id = ?",
-                (task_id, _iso_now(), _iso_now(), session["session_id"]),
-            )
+            if session is not None:
+                conn.execute(
+                    "UPDATE auth_sessions SET task_id = ?, consumed_at = ?, updated_at = ? WHERE session_id = ?",
+                    (task_id, _iso_now(), _iso_now(), session["session_id"]),
+                )
             task = _get_task(conn, task_id)
 
         accounts = json.loads(task["accounts_json"] or "[]")
@@ -549,12 +932,12 @@ class RuntimeManager:
                 accounts=accounts,
                 output_dir=task["output_dir"],
                 output_excel=task["output_excel"],
-                state_storage=task["state_storage"],
-                headless=bool(task["headless"]),
+                state_storage=state_storage,
+                headless=headless,
                 require_login=True,
                 prompt_for_login_if_missing=False,
                 wait_on_anti_spider=False,
-                save_storage_state=False,
+                save_storage_state=True if browser_auth_mode == "legacy_state" else False,
             ),
             hooks=CrawlHooks(on_status=on_status, is_cancelled=is_cancelled),
         )
@@ -579,7 +962,9 @@ class RuntimeManager:
                 output_excel=result.output_excel,
                 finished_at=_iso_now(),
             )
-            session = _get_auth_session(conn, task["login_session_id"])
+            if self.settings.browser_auth_mode != "legacy_state":
+                login_session_id = str(task.get("login_session_id") or "").strip()
+                session = _get_auth_session(conn, login_session_id) if login_session_id else None
         if session and not self.settings.keep_auth_state_for_debug:
             _cleanup_auth_session(self.settings, session)
 
@@ -619,6 +1004,7 @@ def _task_response(task: dict[str, Any]) -> dict[str, Any]:
 
 def _shutdown() -> None:
     global _runtime_manager
+    _close_legacy_login_session()
     if _runtime_manager is not None:
         _runtime_manager.stop()
         _runtime_manager = None
@@ -671,12 +1057,35 @@ def debug_env() -> dict[str, Any]:
             "auth_state_dir": runtime.settings.auth_state_dir,
             "auth_state_dir_exists": Path(runtime.settings.auth_state_dir).exists(),
             "auth_state_dir_writable": os.access(runtime.settings.auth_state_dir, os.W_OK) if Path(runtime.settings.auth_state_dir).exists() else False,
+            "browser_auth_mode": runtime.settings.browser_auth_mode,
+            "legacy_state_json": runtime.settings.legacy_state_json,
+            "legacy_state_json_exists": _legacy_state_exists(runtime.settings),
+            "legacy_state_json_usable": _legacy_state_usable(runtime.settings),
+            "legacy_headless": runtime.settings.legacy_headless,
+            "supports_legacy_state": True,
+            "supports_per_task": True,
             "auth_sessions_columns": _safe_debug_columns(conn, "auth_sessions"),
             "tasks_columns": _safe_debug_columns(conn, "tasks"),
             "worker_alive": bool(runtime.worker_thread and runtime.worker_thread.is_alive()),
             "process_id": os.getpid(),
             "playwright_available": True,
+            "proxy_enabled": _proxy_enabled(),
+            "proxy_server": _safe_proxy_server(),
         }
+
+
+@app.get("/v1/debug/weiq-access")
+def debug_weiq_access() -> dict[str, Any]:
+    runtime = get_runtime_manager()
+    return {
+        "requests": _requests_weiq_access_probe(),
+        "playwright": _playwright_weiq_access_probe(runtime.settings.runtime_dir),
+        "egress": {
+            "public_ip": _detect_public_ip(),
+            "proxy_enabled": _proxy_enabled(),
+            "proxy_server": _safe_proxy_server(),
+        },
+    }
 
 
 @app.post("/v1/auth/session")
@@ -766,22 +1175,63 @@ def check_auth_session(session_id: str) -> dict[str, Any]:
     }
 
 
+@app.post("/v1/auth/legacy/open-login")
+def open_legacy_login() -> dict[str, Any]:
+    runtime = get_runtime_manager()
+    session = _open_legacy_login_browser(runtime.settings)
+    return {
+        "status": "opened",
+        "message": "已打开 legacy 登录浏览器，请在窗口中完成 WEIQ 人工登录并保持窗口打开。",
+        "login_url": session.login_url,
+        "state_json_path": session.state_json_path,
+        "headless": session.headless,
+    }
+
+
+@app.post("/v1/auth/legacy/check")
+def check_legacy_login() -> dict[str, Any]:
+    runtime = get_runtime_manager()
+    payload = _check_legacy_login_session(runtime.settings)
+    payload.update(
+        {
+            "state_json_path": str(_legacy_state_path(runtime.settings)),
+            "state_json_exists": _legacy_state_exists(runtime.settings),
+        }
+    )
+    return payload
+
+
 @app.post("/v1/tasks/crawl")
 def create_crawl_task(request: CrawlTaskRequest) -> dict[str, Any]:
     runtime = get_runtime_manager()
-    if not request.login_session_id:
-        raise HTTPException(status_code=400, detail="login_session_id is required")
     accounts = [item.model_dump() for item in request.accounts]
     if not accounts:
         raise HTTPException(status_code=400, detail="accounts is required")
 
     with db_conn(runtime.settings) as conn:
-        session = _get_auth_session(conn, request.login_session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="login session not found")
-        status, _ = _session_status_for_check(session)
-        if status != "authenticated":
-            raise HTTPException(status_code=400, detail="login session is not authenticated")
+        browser_auth_mode = runtime.settings.browser_auth_mode
+        session = None
+        state_storage = runtime.settings.legacy_state_json if browser_auth_mode == "legacy_state" else None
+        headless = runtime.settings.legacy_headless if browser_auth_mode == "legacy_state" else request.headless
+        if browser_auth_mode == "legacy_state":
+            if not _legacy_state_usable(runtime.settings):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "BLOCKED_AUTH: 请先调用 /v1/auth/legacy/open-login，在打开的浏览器中完成 WEIQ 登录，"
+                        "然后调用 /v1/auth/legacy/check 保存 state.json。"
+                    ),
+                )
+        else:
+            if not request.login_session_id:
+                raise HTTPException(status_code=400, detail="login_session_id is required")
+            session = _get_auth_session(conn, request.login_session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="login session not found")
+            status, _ = _session_status_for_check(session)
+            if status != "authenticated":
+                raise HTTPException(status_code=400, detail="login session is not authenticated")
+            state_storage = session["state_storage"]
 
         task_id = str(uuid4())
         output_dir = str(_ensure_dir(Path(runtime.settings.runtime_dir) / "tasks" / task_id))
@@ -813,9 +1263,9 @@ def create_crawl_task(request: CrawlTaskRequest) -> dict[str, Any]:
                 input_excel,
                 output_excel,
                 output_dir,
-                session["state_storage"],
-                1 if request.headless else 0,
-                request.login_session_id,
+                state_storage,
+                1 if headless else 0,
+                request.login_session_id if browser_auth_mode != "legacy_state" else None,
                 json.dumps(accounts, ensure_ascii=False),
                 request.retry_times,
                 request.retry_backoff_seconds,
@@ -825,10 +1275,11 @@ def create_crawl_task(request: CrawlTaskRequest) -> dict[str, Any]:
                 None,
             ),
         )
-        conn.execute(
-            "UPDATE auth_sessions SET task_id = ?, updated_at = ? WHERE session_id = ?",
-            (task_id, _iso_now(), request.login_session_id),
-        )
+        if session is not None and request.login_session_id:
+            conn.execute(
+                "UPDATE auth_sessions SET task_id = ?, updated_at = ? WHERE session_id = ?",
+                (task_id, _iso_now(), request.login_session_id),
+            )
     runtime.enqueue(task_id)
     return {"task_id": task_id, "status": TaskStatus.PENDING.value, "progress": 0.0, "message": "任务已创建"}
 

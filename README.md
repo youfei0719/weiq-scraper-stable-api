@@ -87,8 +87,10 @@ curl http://127.0.0.1:8080/health
 
 - `GET /v1/worker/health`
 - `GET /v1/debug/env`
+- `GET /v1/debug/weiq-access`
 
 `/v1/debug/env` 只返回安全诊断信息，不返回 cookie、密码、token、`storage_state` 内容。
+`/v1/debug/weiq-access` 会分别用 `httpx` 和 Playwright Chromium 测试 WEIQ 可达性，并返回安全化后的出口信息。
 
 ## 运行时目录与环境变量
 
@@ -114,6 +116,10 @@ WEIQ_API_RUNTIME_DIR=/opt/weiq-scraper-stable-api/runtime
 WEIQ_AUTH_STATE_DIR=/opt/weiq-scraper-stable-api/runtime/auth_sessions
 WEIQ_AUTH_SESSION_TTL_SECONDS=600
 WEIQ_KEEP_AUTH_STATE_FOR_DEBUG=false
+WEIQ_PROXY_SERVER=
+WEIQ_PROXY_USERNAME=
+WEIQ_PROXY_PASSWORD=
+WEIQ_PROXY_BYPASS=
 ```
 
 说明：
@@ -121,6 +127,7 @@ WEIQ_KEEP_AUTH_STATE_FOR_DEBUG=false
 - `WEIQ_DB_PATH` 必须是绝对路径
 - 不要依赖当前工作目录生成 SQLite
 - worker 目前只支持单进程内存队列，必须 `--workers 1`
+- 如果配置 `WEIQ_PROXY_SERVER`，登录提交、抓取执行、Playwright 诊断、`httpx` 诊断都会走同一套代理出口
 
 ## systemd 示例
 
@@ -175,6 +182,23 @@ WantedBy=multi-user.target
 - `阅读量均值`
 
 `weibo` 侧会把 `认证等级` 识别为 `认证层级` 别名，因此不需要第二套导入逻辑。
+
+## 服务器出口被拦截
+
+如果 `/v1/debug/weiq-access` 返回 `blocked_detected=true`，说明代码链路基本正常，但当前 stable-api 运行环境访问 WEIQ 时被目标站点或中间网络拦截。
+
+典型表现：
+
+- `requests.blocked_detected=true`
+- `playwright.blocked_detected=true`
+- 页面标题出现 `The URL you requested has been blocked`
+
+这时不要继续重写抓取流程，优先处理网络出口：
+
+1. 更换能正常访问 WEIQ 的服务器。
+2. 把 stable-api 部署到本机或内网机器，再通过安全隧道让 `weibo` 调用。
+3. 配置稳定且合规的代理出口。
+4. 联系 WEIQ 放行 stable-api 所在服务器的出口 IP。
 
 ## 验证
 
