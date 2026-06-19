@@ -152,6 +152,23 @@ class _AsyncFakeBlockedPage(_AsyncFakePage):
         return _AsyncFakeLocator(text="WEIQ 安全验证", count=1 if "input" in selector else 0)
 
 
+class _AsyncFakeNavigatingPage(_AsyncFakePage):
+    def __init__(self):
+        self.url = "https://www.weiq.com/"
+        self.visited_urls = []
+
+    async def goto(self, url, **kwargs):  # noqa: ANN001, ARG002
+        self.url = url
+        self.visited_urls.append(url)
+
+    async def title(self):
+        return "安全验证" if "/security" in self.url else "WEIQ 控制台"
+
+    def locator(self, selector: str):
+        blocked = "/security" in self.url
+        return _AsyncFakeLocator(text="WEIQ 安全验证" if blocked else "WEIQ 控制台", count=1 if blocked and "input" in selector else 0)
+
+
 class _AsyncFakeContext:
     def __init__(self):
         self.pages = [_AsyncFakePage()]
@@ -1037,6 +1054,36 @@ class TestCloudAPI(unittest.TestCase):
         self.assertEqual(body["current_url"], "https://www.weiq.com/security")
         self.assertEqual(body["page_title"], "安全验证")
         self.assertTrue(body["can_resume"])
+
+    def test_resume_after_auth_opens_task_challenge_before_verifying(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            state_path.write_text(json.dumps({"cookies": [{"name": "sid"}], "origins": []}), encoding="utf-8")
+            with patch.dict(os.environ, {"WEIQ_BROWSER_AUTH_MODE": "browser_worker", "WEIQ_LEGACY_STATE_JSON": str(state_path)}, clear=False), patch(
+                "cloud_api.enqueue_task", return_value=True
+            ):
+                task = cloud_api.create_task(cloud_api.CreateTaskRequest(accounts=[cloud_api.AccountInput(nickname="测试账号", uid="1234567890")]))
+            challenge_url = "https://www.weiq.com/security?account_uid=1234567890"
+            cloud_api.upsert_task_event(
+                task.task_id,
+                {"status": cloud_api.TaskStatus.BLOCKED_AUTH, "current_url": challenge_url, "can_resume": 1},
+            )
+            fake_page = _AsyncFakeNavigatingPage()
+            fake_context = _AsyncFakeContext()
+            fake_context.pages = [fake_page]
+            controller = cloud_api.BROWSER_WORKER_CONTROLLER
+            controller._context = fake_context
+            controller._page = fake_page
+            controller._playwright = _AsyncFakePlaywright()
+            controller._state = {"session_id": "session-target", "runtime_state": "open", "browser_session_running": True}
+
+            with patch.dict(os.environ, {"WEIQ_BROWSER_AUTH_MODE": "browser_worker", "WEIQ_LEGACY_STATE_JSON": str(state_path)}, clear=False):
+                with TestClient(cloud_api.app) as client:
+                    resp = client.post(f"/v1/tasks/{task.task_id}/resume-after-auth")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], cloud_api.TaskStatus.BLOCKED_AUTH)
+        self.assertEqual(fake_page.visited_urls, [challenge_url])
 
     def test_resume_after_auth_requeues_task_after_verification(self):
         with tempfile.TemporaryDirectory() as temp_dir:

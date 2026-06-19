@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import pandas as pd
@@ -1419,6 +1420,19 @@ class BrowserWorkerController:
         async with self._lock:
             if self._context is None or self._page is None:
                 raise HTTPException(status_code=409, detail="远端浏览器会话未打开，请先打开 WEIQ 验证窗口。")
+            row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            if row is None:
+                raise HTTPException(status_code=404, detail="任务不存在")
+
+            target_url = str(row.get("current_url") or "").strip()
+            target_host = urlparse(target_url).hostname or ""
+            should_prepare_target = self._state.get("verification_task_id") != task_id
+            if should_prepare_target and target_url and (target_host == "weiq.com" or target_host.endswith(".weiq.com")):
+                try:
+                    await self._page.goto(target_url, timeout=45000, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                self._set_state(verification_task_id=task_id)
             try:
                 await self._context.storage_state(path=str(get_legacy_state_json_path()))
             except Exception:
@@ -1448,6 +1462,7 @@ class BrowserWorkerController:
                 return build_status_payload(row or {"task_id": task_id, **updates})
 
             _clear_blocked_auth_context(task_id)
+            self._set_state(verification_task_id=None)
             upsert_task_event(
                 task_id,
                 {
