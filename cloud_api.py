@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import shutil
 import sqlite3
@@ -931,8 +932,15 @@ def _find_process_pid(*needles: str) -> int | None:
     required = [needle for needle in needles if needle]
     if not required:
         return None
+    executable = required[0]
     for pid, args in _read_process_table():
-        if all(needle in args for needle in required):
+        try:
+            argv = shlex.split(args)
+        except ValueError:
+            argv = args.split()
+        if not any(Path(token).name == executable for token in argv[:2]):
+            continue
+        if all(needle in args for needle in required[1:]):
             return pid
     return None
 

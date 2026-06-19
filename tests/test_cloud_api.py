@@ -190,6 +190,14 @@ class _AsyncFakePlaywrightManager:
 
 
 class TestCloudAPI(unittest.TestCase):
+    def test_process_discovery_ignores_shell_command_text(self):
+        rows = [
+            (101, "bash -c pgrep -a 'Xvfb :99'"),
+            (102, "Xvfb :99 -screen 0 1440x900x24"),
+        ]
+        with patch.object(cloud_api, "_read_process_table", return_value=rows):
+            self.assertEqual(cloud_api._find_process_pid("Xvfb", ":99"), 102)
+
     @classmethod
     def setUpClass(cls):
         if os.path.exists(cloud_api.DB_PATH):
