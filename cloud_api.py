@@ -1430,6 +1430,7 @@ class BrowserWorkerController:
             if should_prepare_target and target_url and (target_host == "weiq.com" or target_host.endswith(".weiq.com")):
                 try:
                     await self._page.goto(target_url, timeout=45000, wait_until="domcontentloaded")
+                    await self._page.wait_for_timeout(1500)
                 except Exception:
                     pass
                 self._set_state(verification_task_id=task_id)

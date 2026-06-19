@@ -135,6 +135,9 @@ class _AsyncFakePage:
     async def goto(self, *args, **kwargs):  # noqa: ANN002, ANN003
         return None
 
+    async def wait_for_timeout(self, timeout):  # noqa: ANN001, ARG002
+        return None
+
     async def title(self):
         return "WEIQ 控制台"
 
