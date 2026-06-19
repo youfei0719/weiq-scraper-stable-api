@@ -28,7 +28,7 @@ st.markdown(hide_st_style, unsafe_allow_html=True)
 # ==========================================
 # 2. 数据处理与清洗引擎
 # ==========================================
-DATA_FILE = "weiq_results.xlsx"
+DATA_FILE = os.getenv("WEIQ_DATA_FILE", "weiq_results.xlsx")
 
 # 智能中文单位换算器（解决尾数带 .0 的不美观问题）
 def format_chinese_unit(num):
@@ -136,6 +136,17 @@ def main():
     if df.empty:
         st.warning("系统提示：未检测到有效数据，请确认底表状态。")
         return
+
+    if "run_id" in df.columns:
+        run_values = [str(x) for x in df["run_id"].dropna().unique().tolist()]
+        if run_values:
+            run_values = sorted(run_values, reverse=True)
+            selected_run = st.selectbox("选择运行批次 (run_id)", ["全部"] + run_values, index=0)
+            if selected_run != "全部":
+                df = df[df["run_id"].astype(str) == selected_run]
+                if df.empty:
+                    st.warning("所选 run_id 暂无数据。")
+                    return
 
     valid_df = df.dropna(subset=["粉丝数_数值"])
 

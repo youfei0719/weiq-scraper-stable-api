@@ -1,1330 +1,2876 @@
+import asyncio
+import base64
 import json
 import os
 import queue
 import re
+import signal
 import shutil
 import sqlite3
+import socket
+import subprocess
 import threading
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import pandas as pd
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from analytics import incremental_changes, load_result_df, quality_report
 from scraper_runtime import (
     CrawlConfig,
     CrawlHooks,
-    CrawlResult,
+    CrawlRunResult,
     ErrorCode,
     TaskStatus,
-    get_playwright_launch_kwargs,
+    detect_auth_or_challenge,
+    extract_metrics,
     has_usable_storage_state,
     init_browser,
-    load_proxy_settings_from_env,
+    infer_post_extraction_issue,
     run_crawl,
 )
+from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 
+DB_PATH = Path("weiq_local.db").resolve()
+TASK_QUEUE: "queue.Queue[str]" = queue.Queue()
+DB_LOCK = threading.Lock()
+ACTIVE_AUTH_LOCK = threading.Lock()
+ACTIVE_AUTH_SESSIONS: dict[str, dict[str, Any]] = {}
+TASK_TO_SESSION: dict[str, str] = {}
+QUEUE_LOCK = threading.Lock()
+QUEUED_TASK_IDS: set[str] = set()
+ACTIVE_TASK_IDS: set[str] = set()
+WORKER_THREAD: threading.Thread | None = None
+WORKER_STARTED_AT: str | None = None
+LAST_WORKER_ERROR: str | None = None
+AUTH_WAITING_STATUSES = {"pending", "waiting_credentials", "waiting_code", "logging_in"}
+BROWSER_WORKER_LOCK = threading.RLock()
+BROWSER_WORKER_RUNTIME: dict[str, Any] = {}
+BROWSER_DISPLAY_UNAVAILABLE_MESSAGE = (
+    "Browser Worker display is unavailable. Please open browser session first or restart stable-api."
+)
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+STATUS_ZH = {
+    TaskStatus.PENDING: "排队中",
+    TaskStatus.RUNNING: "运行中",
+    TaskStatus.BLOCKED_AUTH: "等待登录",
+    TaskStatus.SUCCESS: "成功",
+    TaskStatus.FAILED: "失败",
+    TaskStatus.CANCELLED: "已取消",
+}
+ERROR_MESSAGES_ZH = {
+    ErrorCode.NONE: "无错误",
+    ErrorCode.INVALID_UID: "账号缺少 uid 参数",
+    ErrorCode.HTTP_BLOCKED: "页面被拦截或返回异常状态",
+    ErrorCode.TIMEOUT: "页面响应超时",
+    ErrorCode.AUTH_REQUIRED: "登录态失效，需要手动登录",
+    ErrorCode.CAPTCHA_REQUIRED: "触发风控验证，需要手动处理",
+    ErrorCode.EMPTY_PAGE: "页面无有效数据，账号可能失效或未收录",
+    ErrorCode.NAVIGATION_ERROR: "页面读取报错",
+    ErrorCode.WRITE_ERROR: "结果写入失败",
+    ErrorCode.CANCELLED: "任务被取消",
+}
 
-
-def _iso_now() -> str:
-    return _utcnow().isoformat()
-
-
-def _ensure_dir(path: str | Path) -> Path:
-    target = Path(path)
-    target.mkdir(parents=True, exist_ok=True)
-    return target
-
-
-def _as_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _normalize_browser_auth_mode(value: str | None) -> str:
-    mode = (value or "").strip().lower()
-    return mode if mode in {"per_task", "legacy_state"} else "per_task"
-
-
-def _proxy_enabled() -> bool:
-    return load_proxy_settings_from_env() is not None
-
-
-def _safe_proxy_server() -> str | None:
-    proxy = load_proxy_settings_from_env()
-    return proxy.safe_server() if proxy else None
-
-
-def _build_blocked_message() -> str:
-    return "当前服务器出口访问 WEIQ 被拦截，无法进入登录页。请更换 stable-api 运行环境、配置合规代理出口，或联系 WEIQ 放行服务器出口 IP。"
-
-
-def _extract_title_from_html(html: str) -> str | None:
-    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    title = re.sub(r"\s+", " ", match.group(1)).strip()
-    return title or None
-
-
-def _detect_blocked_text(*, title: str | None = None, body: str | None = None) -> bool:
-    normalized_title = (title or "").strip().lower()
-    normalized_body = (body or "").strip().lower()
-    markers = [
-        "the url you requested has been blocked",
-        "url you requested has been blocked",
-    ]
-    if any(marker in normalized_title for marker in markers):
-        return True
-    return "blocked" in normalized_body or any(marker in normalized_body for marker in markers)
-
-
-def _httpx_proxy_kwargs() -> dict[str, Any]:
-    proxy = load_proxy_settings_from_env()
-    if not proxy:
-        return {"trust_env": False}
-    return {"proxy": proxy.as_httpx_proxy(), "trust_env": False}
-
-
-def _detect_title_and_blocked_from_page(page) -> tuple[str | None, bool]:
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    ensure_single_worker_mode()
+    init_db()
+    start_worker()
+    recover_incomplete_tasks()
     try:
-        title = page.title()
-    except Exception:
-        title = None
-    body_text = ""
-    try:
-        body_text = page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        try:
-            body_text = page.content()
-        except Exception:
-            body_text = ""
-    return title, _detect_blocked_text(title=title, body=body_text)
-
-
-def _page_body_text(page) -> str:
-    try:
-        return page.locator("body").inner_text(timeout=5000)
-    except Exception:
-        try:
-            return page.content()
-        except Exception:
-            return ""
-
-
-def _legacy_page_has_visible_login_form(page) -> bool:
-    try:
-        inputs = page.locator("input, textarea")
-        count = inputs.count()
-    except Exception:
-        return False
-
-    login_tokens = ("login", "passport", "password", "密码", "验证码", "手机号", "账号", "账户")
-    for index in range(min(count, 20)):
-        try:
-            locator = inputs.nth(index)
-            tag_name = (locator.evaluate("(node) => node.tagName") or "").lower()
-            input_type = (locator.get_attribute("type") or "").lower()
-            placeholder = (locator.get_attribute("placeholder") or "").lower()
-            name = (locator.get_attribute("name") or "").lower()
-            aria_label = (locator.get_attribute("aria-label") or "").lower()
-            value = " ".join([tag_name, input_type, placeholder, name, aria_label])
-        except Exception:
-            continue
-        if "password" in value:
-            return True
-        if any(token in value for token in login_tokens):
-            return True
-    return False
-
-
-def _legacy_page_status(page) -> dict[str, Any]:
-    title, blocked = _detect_title_and_blocked_from_page(page)
-    body_text = _page_body_text(page)
-    url = (page.url or "").strip()
-    normalized_body = body_text.lower()
-    normalized_url = url.lower()
-    login_like = "login" in normalized_url or "passport" in normalized_url or _legacy_page_has_visible_login_form(page)
-    return {
-        "title": title,
-        "blocked": blocked,
-        "login_like": login_like,
-        "authenticated": not blocked and not login_like,
-        "body_excerpt": body_text[:240],
-        "url": url,
-    }
-
-
-def _requests_weiq_access_probe() -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "ok": False,
-        "status_code": None,
-        "final_url": None,
-        "title_detected": None,
-        "blocked_detected": False,
-        "error": None,
-    }
-    try:
-        with httpx.Client(follow_redirects=True, timeout=20.0, **_httpx_proxy_kwargs()) as client:
-            response = client.get("https://www.weiq.com/")
-        title = _extract_title_from_html(response.text)
-        blocked = _detect_blocked_text(title=title, body=response.text)
-        result.update(
-            {
-                "ok": 200 <= response.status_code < 400 and not blocked,
-                "status_code": response.status_code,
-                "final_url": str(response.url),
-                "title_detected": title,
-                "blocked_detected": blocked,
-            }
-        )
-    except Exception as exc:
-        result["error"] = str(exc)
-    return result
-
-
-def _playwright_weiq_access_probe(runtime_dir: str) -> dict[str, Any]:
-    debug_dir = _ensure_dir(Path(runtime_dir) / "debug")
-    screenshot_path = str(debug_dir / f"weiq_access_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.png")
-    result: dict[str, Any] = {
-        "ok": False,
-        "status_code": None,
-        "final_url": None,
-        "title": None,
-        "blocked_detected": False,
-        "screenshot_path": screenshot_path,
-        "error": None,
-    }
-    try:
-        with sync_playwright() as p:
-            browser, context, page = init_browser(p, headless=True, state_storage=None)
-            try:
-                response = page.goto("https://www.weiq.com/", timeout=60000, wait_until="domcontentloaded")
-                title, blocked = _detect_title_and_blocked_from_page(page)
-                page.screenshot(path=screenshot_path, full_page=True)
-                status_code = response.status if response else None
-                result.update(
-                    {
-                        "ok": status_code is not None and 200 <= status_code < 400 and not blocked,
-                        "status_code": status_code,
-                        "final_url": page.url,
-                        "title": title,
-                        "blocked_detected": blocked,
-                    }
-                )
-            finally:
-                browser.close()
-    except Exception as exc:
-        result["error"] = str(exc)
-    return result
-
-
-def _detect_public_ip() -> str | None:
-    try:
-        with httpx.Client(timeout=10.0, **_httpx_proxy_kwargs()) as client:
-            response = client.get("https://api.ipify.org?format=json")
-        response.raise_for_status()
-        payload = response.json()
-    except Exception:
-        return None
-    ip = payload.get("ip")
-    return str(ip) if ip else None
-
-
-@dataclass(slots=True)
-class ApiSettings:
-    db_path: str
-    runtime_dir: str
-    auth_state_dir: str
-    auth_session_ttl_seconds: int
-    keep_auth_state_for_debug: bool
-    browser_auth_mode: str
-    legacy_state_json: str
-    legacy_headless: bool
-    login_url: str
-    proxy_server: str | None
-    proxy_username: str | None
-    proxy_password: str | None
-    proxy_bypass: str | None
-
-
-@dataclass(slots=True)
-class LegacyLoginBrowserSession:
-    playwright: Any
-    browser: Any
-    context: Any
-    page: Any
-    login_url: str
-    state_json_path: str
-    headless: bool
-    opened_at: datetime
-    last_checked_at: datetime | None = None
-
-
-_legacy_login_session_lock = threading.Lock()
-_legacy_login_session: LegacyLoginBrowserSession | None = None
-
-
-def load_settings() -> ApiSettings:
-    runtime_dir = os.environ.get("WEIQ_API_RUNTIME_DIR", "/opt/weiq-scraper-stable-api/runtime")
-    auth_state_dir = os.environ.get("WEIQ_AUTH_STATE_DIR", str(Path(runtime_dir) / "auth_sessions"))
-    db_path = os.environ.get("WEIQ_DB_PATH", "/opt/weiq-scraper-stable-api/weiq_local.db")
-    legacy_state_json = os.environ.get("WEIQ_LEGACY_STATE_JSON", str(Path(runtime_dir) / "state.json"))
-    return ApiSettings(
-        db_path=db_path,
-        runtime_dir=runtime_dir,
-        auth_state_dir=auth_state_dir,
-        auth_session_ttl_seconds=int(os.environ.get("WEIQ_AUTH_SESSION_TTL_SECONDS", "600")),
-        keep_auth_state_for_debug=_as_bool(os.environ.get("WEIQ_KEEP_AUTH_STATE_FOR_DEBUG"), False),
-        browser_auth_mode=_normalize_browser_auth_mode(os.environ.get("WEIQ_BROWSER_AUTH_MODE")),
-        legacy_state_json=legacy_state_json,
-        legacy_headless=_as_bool(os.environ.get("WEIQ_LEGACY_HEADLESS"), False),
-        login_url=os.environ.get("WEIQ_LOGIN_URL", "https://www.weiq.com/"),
-        proxy_server=os.environ.get("WEIQ_PROXY_SERVER", "").strip() or None,
-        proxy_username=os.environ.get("WEIQ_PROXY_USERNAME", "").strip() or None,
-        proxy_password=os.environ.get("WEIQ_PROXY_PASSWORD", "").strip() or None,
-        proxy_bypass=os.environ.get("WEIQ_PROXY_BYPASS", "").strip() or None,
-    )
-
-
-def _assert_single_worker() -> None:
-    for env_name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
-        raw = os.environ.get(env_name)
-        if raw and raw.isdigit() and int(raw) > 1:
-            raise RuntimeError("cloud_api.py 目前只支持单 worker 进程，请使用 --workers 1")
-
-
-def _connect(settings: ApiSettings) -> sqlite3.Connection:
-    _ensure_dir(Path(settings.db_path).parent)
-    conn = sqlite3.connect(settings.db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-@contextmanager
-def db_conn(settings: ApiSettings):
-    conn = _connect(settings)
-    try:
-        yield conn
-        conn.commit()
+        yield
     finally:
-        conn.close()
+        await BROWSER_WORKER_CONTROLLER.close()
 
 
-AUTH_SESSION_COLUMNS: dict[str, str] = {
-    "session_id": "TEXT PRIMARY KEY",
-    "task_id": "TEXT",
-    "status": "TEXT NOT NULL",
-    "login_url": "TEXT",
-    "message": "TEXT",
-    "expires_at": "TEXT",
-    "state_storage": "TEXT",
-    "preview_image_path": "TEXT",
-    "created_at": "TEXT",
-    "updated_at": "TEXT",
-    "consumed_at": "TEXT",
-    "expired_at": "TEXT",
-    "cleanup_at": "TEXT",
-}
-
-TASK_COLUMNS: dict[str, str] = {
-    "task_id": "TEXT PRIMARY KEY",
-    "status": "TEXT NOT NULL",
-    "progress": "REAL DEFAULT 0",
-    "current_account": "TEXT",
-    "total_accounts": "INTEGER DEFAULT 0",
-    "processed_accounts": "INTEGER DEFAULT 0",
-    "success_accounts": "INTEGER DEFAULT 0",
-    "failed_accounts": "INTEGER DEFAULT 0",
-    "skipped_accounts": "INTEGER DEFAULT 0",
-    "message": "TEXT",
-    "error_code": "TEXT",
-    "input_excel": "TEXT",
-    "output_excel": "TEXT",
-    "output_dir": "TEXT",
-    "state_storage": "TEXT",
-    "headless": "INTEGER DEFAULT 1",
-    "login_session_id": "TEXT",
-    "accounts_json": "TEXT",
-    "retry_times": "INTEGER DEFAULT 1",
-    "retry_backoff_seconds": "INTEGER DEFAULT 3",
-    "resume": "INTEGER DEFAULT 0",
-    "created_at": "TEXT",
-    "updated_at": "TEXT",
-    "started_at": "TEXT",
-    "finished_at": "TEXT",
-}
+app = FastAPI(title="WEIQ Scraper API", version="0.2.0", lifespan=app_lifespan)
 
 
-def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
-    existing = {
-        row["name"]
-        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-    }
-    for column, ddl in columns.items():
-        if column not in existing:
-            ddl_for_alter = ddl.replace(" PRIMARY KEY", "")
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_for_alter}")
-
-
-def init_db(settings: ApiSettings) -> None:
-    with db_conn(settings) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS auth_sessions (
-                session_id TEXT PRIMARY KEY,
-                task_id TEXT,
-                status TEXT NOT NULL,
-                login_url TEXT,
-                message TEXT,
-                expires_at TEXT,
-                state_storage TEXT,
-                preview_image_path TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                consumed_at TEXT,
-                expired_at TEXT,
-                cleanup_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                progress REAL DEFAULT 0,
-                current_account TEXT,
-                total_accounts INTEGER DEFAULT 0,
-                processed_accounts INTEGER DEFAULT 0,
-                success_accounts INTEGER DEFAULT 0,
-                failed_accounts INTEGER DEFAULT 0,
-                skipped_accounts INTEGER DEFAULT 0,
-                message TEXT,
-                error_code TEXT,
-                input_excel TEXT,
-                output_excel TEXT,
-                output_dir TEXT,
-                state_storage TEXT,
-                headless INTEGER DEFAULT 1,
-                login_session_id TEXT,
-                accounts_json TEXT,
-                retry_times INTEGER DEFAULT 1,
-                retry_backoff_seconds INTEGER DEFAULT 3,
-                resume INTEGER DEFAULT 0,
-                created_at TEXT,
-                updated_at TEXT,
-                started_at TEXT,
-                finished_at TEXT
-            )
-            """
-        )
-        _ensure_columns(conn, "auth_sessions", AUTH_SESSION_COLUMNS)
-        _ensure_columns(conn, "tasks", TASK_COLUMNS)
-
-
-def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def _get_auth_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM auth_sessions WHERE session_id = ?", (session_id,)).fetchone()
-    return _row_to_dict(row)
-
-
-def _get_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
-    return _row_to_dict(row)
-
-
-def _update_row(conn: sqlite3.Connection, table: str, pk_name: str, pk_value: str, **updates: Any) -> None:
-    if not updates:
-        return
-    updates["updated_at"] = _iso_now()
-    columns = ", ".join(f"{key} = ?" for key in updates)
-    values = list(updates.values()) + [pk_value]
-    conn.execute(f"UPDATE {table} SET {columns} WHERE {pk_name} = ?", values)
-
-
-def _cleanup_auth_session(settings: ApiSettings, session: dict[str, Any]) -> None:
-    state_storage = session.get("state_storage")
-    if not state_storage:
-        return
-    session_dir = Path(state_storage).parent
-    if session_dir.exists():
-        shutil.rmtree(session_dir, ignore_errors=True)
-    with db_conn(settings) as conn:
-        conn.execute(
-            "UPDATE auth_sessions SET cleanup_at = ?, updated_at = ? WHERE session_id = ?",
-            (_iso_now(), _iso_now(), session["session_id"]),
-        )
-
-
-def _legacy_state_path(settings: ApiSettings) -> Path:
-    return Path(settings.legacy_state_json)
-
-
-def _legacy_state_exists(settings: ApiSettings) -> bool:
-    return _legacy_state_path(settings).exists()
-
-
-def _legacy_state_usable(settings: ApiSettings) -> bool:
-    return has_usable_storage_state(settings.legacy_state_json)
-
-
-def _close_legacy_login_session() -> None:
-    global _legacy_login_session
-    with _legacy_login_session_lock:
-        session = _legacy_login_session
-        _legacy_login_session = None
-    if session is None:
-        return
-    for resource_name in ("context", "browser"):
-        resource = getattr(session, resource_name, None)
-        if resource is None:
-            continue
-        try:
-            resource.close()
-        except Exception:
-            pass
-    playwright = getattr(session, "playwright", None)
-    if playwright is not None:
-        try:
-            playwright.stop()
-        except Exception:
-            pass
-
-
-def _get_legacy_login_session() -> LegacyLoginBrowserSession | None:
-    with _legacy_login_session_lock:
-        session = _legacy_login_session
-    if session is None:
-        return None
-    try:
-        _ = session.page.url
-        return session
-    except Exception:
-        _close_legacy_login_session()
-        return None
-
-
-def _set_legacy_login_session(session: LegacyLoginBrowserSession | None) -> None:
-    global _legacy_login_session
-    with _legacy_login_session_lock:
-        _legacy_login_session = session
-
-
-def _open_legacy_login_browser(settings: ApiSettings) -> LegacyLoginBrowserSession:
-    _close_legacy_login_session()
-    state_path = _legacy_state_path(settings)
-    _ensure_dir(state_path.parent)
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(**get_playwright_launch_kwargs(headless=settings.legacy_headless))
-    context = browser.new_context()
-    page = context.new_page()
-    page.goto(settings.login_url, timeout=60000, wait_until="domcontentloaded")
-    session = LegacyLoginBrowserSession(
-        playwright=playwright,
-        browser=browser,
-        context=context,
-        page=page,
-        login_url=settings.login_url,
-        state_json_path=str(state_path),
-        headless=settings.legacy_headless,
-        opened_at=_utcnow(),
-    )
-    _set_legacy_login_session(session)
-    return session
-
-
-def _check_legacy_login_session(settings: ApiSettings) -> dict[str, Any]:
-    state_path = _legacy_state_path(settings)
-    session = _get_legacy_login_session()
-    state_exists = state_path.exists()
-    payload: dict[str, Any] = {
-        "authenticated": False,
-        "state_json_exists": state_exists,
-        "state_json_path": str(state_path),
-        "message": "未检测到可用的 legacy 登录浏览器",
-        "blocked": False,
-    }
-    if session is None:
-        if _legacy_state_usable(settings):
-            payload.update(
-                {
-                    "authenticated": True,
-                    "message": "已检测到可用的 legacy 登录态",
-                }
-            )
-        return payload
-
-    session.last_checked_at = _utcnow()
-    page_status = _legacy_page_status(session.page)
-    if page_status["blocked"]:
-        payload["blocked"] = True
-        payload["message"] = _build_blocked_message()
-        return payload
-
-    if page_status["login_like"]:
-        payload["message"] = "当前浏览器仍停留在 WEIQ 登录页，请先完成人工登录"
-        return payload
-
-    try:
-        _ensure_dir(state_path.parent)
-        session.context.storage_state(path=str(state_path))
-    except Exception as exc:
-        payload["message"] = f"保存 legacy 登录态失败: {exc}"
-        return payload
-
-    if _legacy_state_usable(settings):
-        payload.update(
-            {
-                "authenticated": True,
-                "message": "已保存可用的 legacy 登录态",
-            }
-        )
-    else:
-        payload["message"] = "已尝试保存 legacy 登录态，但文件不可用"
-    return payload
-
-
-def _session_status_for_check(session: dict[str, Any]) -> tuple[str, str]:
-    expires_at = _parse_iso(session.get("expires_at"))
-    if expires_at and expires_at <= _utcnow():
-        return "expired", "登录会话已过期"
-    if has_usable_storage_state(session.get("state_storage")):
-        return "authenticated", "本次抓取临时 WEIQ 登录成功"
-    if session.get("status") == "failed":
-        return "failed", session.get("message") or "登录失败"
-    if session.get("status") == "waiting_code":
-        return "waiting_code", session.get("message") or "等待验证码"
-    return "waiting_credentials", session.get("message") or "等待提交登录信息"
-
-
-def _safe_debug_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-
-
-def _write_accounts_excel(path: str, accounts: list[dict[str, Any]]) -> None:
-    _ensure_dir(Path(path).parent)
-    pd.DataFrame(accounts).to_excel(path, index=False)
-
-
-def _find_first(page, selectors: list[str]):
-    for selector in selectors:
-        locator = page.locator(selector)
-        try:
-            if locator.count() > 0:
-                return locator.first
-        except Exception:
-            continue
-    return None
-
-
-def _collect_visible_inputs(page) -> list[dict[str, str]]:
-    js = """
-    () => Array.from(document.querySelectorAll('input, textarea'))
-      .filter((el) => {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-      })
-      .slice(0, 20)
-      .map((el) => ({
-        tag: (el.tagName || '').toLowerCase(),
-        type: el.getAttribute('type') || '',
-        name: el.getAttribute('name') || '',
-        placeholder: el.getAttribute('placeholder') || '',
-        id: el.getAttribute('id') || '',
-        class: el.getAttribute('class') || '',
-      }))
-    """
-    try:
-        return page.evaluate(js)
-    except Exception:
-        return []
-
-
-def _build_login_debug_message(page, prefix: str) -> str:
-    try:
-        title = page.title()
-    except Exception:
-        title = ""
-    inputs = _collect_visible_inputs(page)
-    input_preview = "; ".join(
-        f"type={item.get('type','')} name={item.get('name','')} placeholder={item.get('placeholder','')} id={item.get('id','')} class={item.get('class','')}"
-        for item in inputs[:8]
-    )
-    parts = [prefix, f"url={page.url}", f"title={title}"]
-    if input_preview:
-        parts.append(f"visible_inputs={input_preview}")
-    return " | ".join(parts)
-
-
-def _save_login_failure_artifacts(page, session: dict[str, Any]) -> str | None:
-    session_dir = Path(session["state_storage"]).parent
-    screenshot_path = session_dir / "login_failed.png"
-    try:
-        page.screenshot(path=str(screenshot_path), full_page=True)
-        return str(screenshot_path)
-    except Exception:
-        return None
-
-
-def _submit_auth_session_with_browser(session: dict[str, Any], payload: dict[str, Any], settings: ApiSettings) -> tuple[str, str]:
-    login_type = str(payload.get("login_type") or "").strip()
-    action = str(payload.get("action") or "submit").strip()
-    state_storage = session["state_storage"]
-    _ensure_dir(Path(state_storage).parent)
-    with sync_playwright() as p:
-        browser, context, page = init_browser(p, headless=True, state_storage=None)
-        try:
-            page.goto(settings.login_url, timeout=60000, wait_until="domcontentloaded")
-            _, blocked_detected = _detect_title_and_blocked_from_page(page)
-            if blocked_detected:
-                _save_login_failure_artifacts(page, session)
-                return "failed", _build_blocked_message()
-            if login_type == "password":
-                username = payload.get("username") or payload.get("phone") or payload.get("account")
-                password = payload.get("password")
-                if not username or not password:
-                    return "waiting_credentials", "缺少账号或密码"
-                user_input = _find_first(page, ["input[type='text']", "input[placeholder*='手机号']", "input[placeholder*='账号']", "input[name='mobile']", "input[name='phone']", "input[name='username']"])
-                pass_input = _find_first(page, ["input[type='password']", "input[placeholder*='密码']", "input[name='password']"])
-                submit_btn = _find_first(page, ["button:has-text('登录')", "button:has-text('立即登录')", "button[type='submit']"])
-                if user_input is None:
-                    _save_login_failure_artifacts(page, session)
-                    return "failed", _build_login_debug_message(page, "找不到账号输入框")
-                if pass_input is None:
-                    _save_login_failure_artifacts(page, session)
-                    return "failed", _build_login_debug_message(page, "找不到密码输入框")
-                if submit_btn is None:
-                    _save_login_failure_artifacts(page, session)
-                    return "failed", _build_login_debug_message(page, "找不到登录提交按钮")
-                user_input.fill(str(username))
-                pass_input.fill(str(password))
-                submit_btn.click()
-            elif login_type == "phone_code":
-                phone = payload.get("phone")
-                if not phone:
-                    return "waiting_credentials", "缺少手机号"
-                phone_input = _find_first(page, ["input[type='tel']", "input[placeholder*='手机号']", "input[name='mobile']", "input[name='phone']"])
-                if phone_input is None:
-                    _save_login_failure_artifacts(page, session)
-                    return "failed", _build_login_debug_message(page, "找不到账号输入框")
-                phone_input.fill(str(phone))
-                if action == "send_code":
-                    send_btn = _find_first(page, ["button:has-text('发送验证码')", "button:has-text('获取验证码')", "button:has-text('发送')"])
-                    if send_btn is None:
-                        _save_login_failure_artifacts(page, session)
-                        return "failed", _build_login_debug_message(page, "找不到发送验证码按钮")
-                    send_btn.click()
-                    return "waiting_code", "验证码已发送，请提交验证码"
-                code = payload.get("code") or payload.get("verification_code")
-                if not code:
-                    return "waiting_code", "等待验证码"
-                code_input = _find_first(page, ["input[placeholder*='验证码']", "input[name='code']", "input[name='sms_code']", "input[inputmode='numeric']"])
-                submit_btn = _find_first(page, ["button:has-text('登录')", "button:has-text('确认')", "button[type='submit']"])
-                if code_input is None:
-                    _save_login_failure_artifacts(page, session)
-                    return "failed", _build_login_debug_message(page, "需要验证码")
-                if submit_btn is None:
-                    _save_login_failure_artifacts(page, session)
-                    return "failed", _build_login_debug_message(page, "找不到验证码登录提交按钮")
-                code_input.fill(str(code))
-                submit_btn.click()
-            else:
-                return "waiting_credentials", "不支持的 login_type"
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except PlaywrightTimeoutError:
-                pass
-            context.storage_state(path=state_storage)
-            if has_usable_storage_state(state_storage):
-                return "authenticated", "本次抓取临时 WEIQ 登录成功"
-            _save_login_failure_artifacts(page, session)
-            return "waiting_credentials", _build_login_debug_message(page, "未检测到有效登录态，请重试")
-        except PlaywrightTimeoutError:
-            _save_login_failure_artifacts(page, session)
-            return "failed", _build_login_debug_message(page, "触发人机验证或页面加载超时")
-        except Exception as exc:
-            _save_login_failure_artifacts(page, session)
-            return "failed", _build_login_debug_message(page, f"登录执行异常: {exc}")
-        finally:
-            browser.close()
-
-
-class AccountPayload(BaseModel):
+class AccountInput(BaseModel):
     nickname: str | None = None
     uid: str
     account_id: str | None = None
 
 
-class CreateAuthSessionRequest(BaseModel):
+class CreateTaskRequest(BaseModel):
+    accounts: list[AccountInput] | None = None
+    input_excel: str | None = Field(default=None)
+    output_excel: str | None = Field(default=None)
+    output_dir: str | None = Field(default=None)
+    state_json: str | None = Field(default=None)
+    state_storage: str | None = Field(default=None)
+    headless: bool = Field(default=True)
+    cooldown_every: int = Field(default=50)
+    cooldown_seconds: int = Field(default=180)
+    retry_times: int = Field(default=1)
+    retry_backoff_seconds: int = Field(default=3)
+    resume: bool = Field(default=True)
+
+
+class TaskControlResponse(BaseModel):
     task_id: str | None = None
+    status: str
+    message: str
 
 
-class SubmitAuthSessionRequest(BaseModel):
-    login_type: str
-    action: str | None = "submit"
+class AuthSessionResponse(BaseModel):
+    session_id: str
+    status: str
+    login_url: str | None = None
+    page_image_url: str | None = None
+    page_image_base64: str | None = None
+    qr_image_url: str | None = None
+    qr_image_base64: str | None = None
+    message: str | None = None
+    expires_at: str | None = None
+    task_id: str | None = None
+    available_login_types: list[str] = Field(default_factory=lambda: ["password", "phone_code"])
+
+
+class AuthSessionCreateRequest(BaseModel):
+    task_id: str | None = None
+    eager: bool = Field(default=False)
+
+
+class AuthAttachTaskRequest(BaseModel):
+    task_id: str
+
+
+class AuthSubmitRequest(BaseModel):
+    login_type: str = Field(default="password")
+    action: str = Field(default="submit")
     username: str | None = None
     password: str | None = None
     phone: str | None = None
-    code: str | None = None
     verification_code: str | None = None
 
 
-class CrawlTaskRequest(BaseModel):
-    accounts: list[AccountPayload]
-    login_session_id: str | None = None
-    headless: bool = True
-    retry_times: int = 1
-    retry_backoff_seconds: int = 3
-    resume: bool = False
+class WorkerHealthResponse(BaseModel):
+    worker_alive: bool
+    worker_started_at: str | None = None
+    queue_size: int
+    queued_task_ids: list[str]
+    pending_count: int
+    running_count: int
+    last_worker_error: str | None = None
+    process_id: int
+    db_path: str
 
 
-class RuntimeManager:
-    def __init__(self, settings: ApiSettings):
-        self.settings = settings
-        self.queue: queue.Queue[str] = queue.Queue()
-        self.stop_event = threading.Event()
-        self.worker_thread: threading.Thread | None = None
-        self.lock = threading.Lock()
-        self.last_worker_error: str | None = None
-
-    def start(self) -> None:
-        _assert_single_worker()
-        _ensure_dir(self.settings.runtime_dir)
-        _ensure_dir(self.settings.auth_state_dir)
-        init_db(self.settings)
-        with self.lock:
-            if self.worker_thread and self.worker_thread.is_alive():
-                return
-            self.worker_thread = threading.Thread(target=self._worker_loop, name="weiq-api-worker", daemon=True)
-            self.worker_thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=2)
-
-    def enqueue(self, task_id: str) -> None:
-        self.queue.put(task_id)
-
-    def _worker_loop(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                task_id = self.queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                self._run_task(task_id)
-            except Exception as exc:
-                self.last_worker_error = str(exc)
-                with db_conn(self.settings) as conn:
-                    _update_row(
-                        conn,
-                        "tasks",
-                        "task_id",
-                        task_id,
-                        status=TaskStatus.FAILED.value,
-                        message=f"worker 执行失败: {exc}",
-                        error_code=ErrorCode.RUNTIME_ERROR.value,
-                        finished_at=_iso_now(),
-                    )
-            finally:
-                self.queue.task_done()
-
-    def _run_task(self, task_id: str) -> None:
-        with db_conn(self.settings) as conn:
-            task = _get_task(conn, task_id)
-            if task is None:
-                return
-            if task["status"] == TaskStatus.CANCELLED.value:
-                return
-            browser_auth_mode = self.settings.browser_auth_mode
-            session = None
-            state_storage = task.get("state_storage")
-            headless = bool(task["headless"])
-            if browser_auth_mode == "legacy_state":
-                state_storage = self.settings.legacy_state_json
-                headless = self.settings.legacy_headless
-                if not has_usable_storage_state(state_storage):
-                    raise RuntimeError("legacy 登录态缺少有效 storage_state")
-            else:
-                session_id = str(task.get("login_session_id") or "").strip()
-                if not session_id:
-                    raise RuntimeError("登录会话不存在")
-                session = _get_auth_session(conn, session_id)
-                if session is None:
-                    raise RuntimeError("登录会话不存在")
-                if not has_usable_storage_state(session.get("state_storage")):
-                    raise RuntimeError("登录会话缺少有效 storage_state")
-                state_storage = session["state_storage"]
-                headless = bool(task["headless"])
-            _update_row(
-                conn,
-                "tasks",
-                "task_id",
-                task_id,
-                status=TaskStatus.RUNNING.value,
-                started_at=_iso_now(),
-                message="任务开始执行",
-                state_storage=state_storage,
-            )
-            if session is not None:
-                conn.execute(
-                    "UPDATE auth_sessions SET task_id = ?, consumed_at = ?, updated_at = ? WHERE session_id = ?",
-                    (task_id, _iso_now(), _iso_now(), session["session_id"]),
-                )
-            task = _get_task(conn, task_id)
-
-        accounts = json.loads(task["accounts_json"] or "[]")
-
-        def is_cancelled() -> bool:
-            with db_conn(self.settings) as conn:
-                latest = _get_task(conn, task_id)
-                return bool(latest and latest["status"] == TaskStatus.CANCELLED.value)
-
-        def on_status(**payload: Any) -> None:
-            updates: dict[str, Any] = {}
-            for key in (
-                "status",
-                "progress",
-                "current_account",
-                "total_accounts",
-                "processed_accounts",
-                "success_accounts",
-                "failed_accounts",
-                "skipped_accounts",
-                "message",
-            ):
-                if key in payload:
-                    updates[key] = payload[key]
-            if updates:
-                with db_conn(self.settings) as conn:
-                    _update_row(conn, "tasks", "task_id", task_id, **updates)
-
-        result = run_crawl(
-            CrawlConfig(
-                accounts=accounts,
-                output_dir=task["output_dir"],
-                output_excel=task["output_excel"],
-                state_storage=state_storage,
-                headless=headless,
-                require_login=True,
-                prompt_for_login_if_missing=False,
-                wait_on_anti_spider=False,
-                save_storage_state=True if browser_auth_mode == "legacy_state" else False,
-            ),
-            hooks=CrawlHooks(on_status=on_status, is_cancelled=is_cancelled),
-        )
-
-        with db_conn(self.settings) as conn:
-            status = result.status.value
-            error_code = result.error_code.value if result.error_code else None
-            _update_row(
-                conn,
-                "tasks",
-                "task_id",
-                task_id,
-                status=status,
-                progress=1.0 if status == TaskStatus.SUCCESS.value else task.get("progress", 0),
-                total_accounts=result.total_accounts,
-                processed_accounts=result.processed_accounts,
-                success_accounts=result.success_accounts,
-                failed_accounts=result.failed_accounts,
-                skipped_accounts=result.skipped_accounts,
-                message=result.message,
-                error_code=error_code,
-                output_excel=result.output_excel,
-                finished_at=_iso_now(),
-            )
-            if self.settings.browser_auth_mode != "legacy_state":
-                login_session_id = str(task.get("login_session_id") or "").strip()
-                session = _get_auth_session(conn, login_session_id) if login_session_id else None
-        if session and not self.settings.keep_auth_state_for_debug:
-            _cleanup_auth_session(self.settings, session)
+class BrowserAuthStatusResponse(BaseModel):
+    auth_mode: str
+    authenticated: bool
+    state_json_exists: bool
+    worker_available: bool
+    login_status: str
+    browser_session_running: bool = False
+    novnc_running: bool = False
+    browser_display: str | None = None
+    display_ready: bool = False
+    xvfb_running: bool = False
+    x11vnc_running: bool = False
+    websockify_running: bool = False
+    crawl_will_use_display: bool = False
+    session_id: str | None = None
+    novnc_local_url: str | None = None
+    novnc_proxy_path: str | None = None
+    expires_at: str | None = None
+    blocked: bool = False
+    page_title: str | None = None
+    saved_auth_state_present: bool = False
+    live_auth_verified: bool = False
+    runtime_state: str = "closed"
+    message: str | None = None
 
 
-_runtime_manager: RuntimeManager | None = None
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def get_runtime_manager() -> RuntimeManager:
-    global _runtime_manager
-    if _runtime_manager is None:
-        _runtime_manager = RuntimeManager(load_settings())
-        _runtime_manager.start()
-    return _runtime_manager
+def expiry_iso(minutes: int = 10) -> str:
+    return (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
 
 
-def _task_response(task: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "task_id": task["task_id"],
-        "status": task["status"],
-        "progress": task["progress"],
-        "current_account": task["current_account"],
-        "total_accounts": task["total_accounts"],
-        "processed_accounts": task["processed_accounts"],
-        "success_accounts": task["success_accounts"],
-        "failed_accounts": task["failed_accounts"],
-        "skipped_accounts": task["skipped_accounts"],
-        "message": task["message"],
-        "error_code": task["error_code"],
-        "login_session_id": task["login_session_id"],
-        "output_excel": task["output_excel"],
-        "export_file": task["output_excel"],
-        "created_at": task["created_at"],
-        "started_at": task["started_at"],
-        "finished_at": task["finished_at"],
-    }
-
-
-def _shutdown() -> None:
-    global _runtime_manager
-    _close_legacy_login_session()
-    if _runtime_manager is not None:
-        _runtime_manager.stop()
-        _runtime_manager = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    get_runtime_manager()
+def parse_iso(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
     try:
-        yield
-    finally:
-        _shutdown()
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
-app = FastAPI(title="WEIQ Scraper Stable API", lifespan=lifespan)
+def get_runtime_dir() -> Path:
+    runtime_dir = Path(os.getenv("WEIQ_API_RUNTIME_DIR", "./runtime")).expanduser()
+    if not runtime_dir.is_absolute():
+        runtime_dir = (Path.cwd() / runtime_dir).resolve()
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
 
 
-@app.get("/health")
-def health() -> dict[str, Any]:
-    return {"status": "ok", "time": _iso_now()}
+def get_auth_mode() -> str:
+    raw = os.getenv("WEIQ_BROWSER_AUTH_MODE", "").strip() or os.getenv("WEIQ_AUTH_MODE", "per_task").strip()
+    return raw.lower() or "per_task"
 
 
-@app.get("/v1/worker/health")
-def worker_health() -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        pending_count = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TaskStatus.PENDING.value,)).fetchone()[0]
-        running_count = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (TaskStatus.RUNNING.value,)).fetchone()[0]
+def get_legacy_state_json_path() -> Path:
+    raw = os.getenv("WEIQ_LEGACY_STATE_JSON", "").strip()
+    path = Path(raw or (get_runtime_dir() / "state.json")).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_browser_user_data_dir() -> Path:
+    raw = os.getenv("WEIQ_BROWSER_USER_DATA_DIR", "").strip()
+    path = Path(raw or (get_runtime_dir() / "browser_profile")).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_browser_headless() -> bool:
+    raw = os.getenv("WEIQ_BROWSER_HEADLESS")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_browser_display() -> str:
+    return os.getenv("WEIQ_BROWSER_DISPLAY", ":99").strip() or ":99"
+
+
+def get_browser_screen_geometry() -> str:
+    return os.getenv("WEIQ_BROWSER_SCREEN", "1600x900x24").strip() or "1600x900x24"
+
+
+def get_browser_session_ttl_seconds() -> int:
+    raw = os.getenv("WEIQ_BROWSER_SESSION_TTL_SECONDS", "").strip()
+    if raw.isdigit():
+        return max(int(raw), 120)
+    return 600
+
+
+def get_browser_vnc_port() -> int:
+    raw = os.getenv("WEIQ_BROWSER_VNC_PORT", "5901").strip()
+    if raw.isdigit():
+        return max(int(raw), 1024)
+    return 5901
+
+
+def get_browser_novnc_port() -> int:
+    raw = os.getenv("WEIQ_BROWSER_NOVNC_PORT", "6080").strip()
+    if raw.isdigit():
+        return max(int(raw), 1024)
+    return 6080
+
+
+def get_browser_proxy_path() -> str:
+    raw = os.getenv("WEIQ_BROWSER_PROXY_PATH", "/browser-session/").strip() or "/browser-session/"
+    if not raw.startswith("/"):
+        raw = f"/{raw}"
+    if not raw.endswith("/"):
+        raw = f"{raw}/"
+    return raw
+
+
+def get_novnc_web_dir() -> Path:
+    raw = os.getenv("WEIQ_NOVNC_WEB_DIR", "/opt/noVNC").strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
+def get_auth_session_ttl_seconds() -> int:
+    raw = os.getenv("WEIQ_AUTH_SESSION_TTL_SECONDS", "").strip()
+    if raw.isdigit():
+        return max(int(raw), 60)
+    return 600
+
+
+def keep_auth_state_for_debug() -> bool:
+    return os.getenv("WEIQ_KEEP_AUTH_STATE_FOR_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_auth_state_dir() -> Path:
+    raw = os.getenv("WEIQ_AUTH_STATE_DIR", "").strip()
+    base_dir = Path(raw or (get_runtime_dir() / "auth_sessions")).expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (Path.cwd() / base_dir).resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+
+def get_task_runtime_dir(task_id: str) -> Path:
+    target = get_runtime_dir() / "tasks" / task_id
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def get_auth_session_dir(session_id: str) -> Path:
+    target = get_auth_state_dir() / session_id
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def build_auth_session_paths(session_id: str) -> dict[str, str]:
+    session_dir = get_auth_session_dir(session_id)
     return {
-        "worker_alive": bool(runtime.worker_thread and runtime.worker_thread.is_alive()),
-        "queue_size": runtime.queue.qsize(),
-        "pending_count": pending_count,
-        "running_count": running_count,
-        "last_worker_error": runtime.last_worker_error,
-        "process_id": os.getpid(),
-        "db_path": runtime.settings.db_path,
+        "session_dir": str(session_dir.resolve()),
+        "state_storage": str((session_dir / "storage_state.json").resolve()),
+        "preview_image_path": str((session_dir / "preview.png").resolve()),
+        "meta_path": str((session_dir / "meta.json").resolve()),
     }
 
 
-@app.get("/v1/debug/env")
-def debug_env() -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        return {
-            "cwd": os.getcwd(),
-            "python_executable": os.sys.executable,
-            "db_path": runtime.settings.db_path,
-            "db_exists": Path(runtime.settings.db_path).exists(),
-            "runtime_dir": runtime.settings.runtime_dir,
-            "auth_state_dir": runtime.settings.auth_state_dir,
-            "auth_state_dir_exists": Path(runtime.settings.auth_state_dir).exists(),
-            "auth_state_dir_writable": os.access(runtime.settings.auth_state_dir, os.W_OK) if Path(runtime.settings.auth_state_dir).exists() else False,
-            "browser_auth_mode": runtime.settings.browser_auth_mode,
-            "legacy_state_json": runtime.settings.legacy_state_json,
-            "legacy_state_json_exists": _legacy_state_exists(runtime.settings),
-            "legacy_state_json_usable": _legacy_state_usable(runtime.settings),
-            "legacy_headless": runtime.settings.legacy_headless,
-            "supports_legacy_state": True,
-            "supports_per_task": True,
-            "auth_sessions_columns": _safe_debug_columns(conn, "auth_sessions"),
-            "tasks_columns": _safe_debug_columns(conn, "tasks"),
-            "worker_alive": bool(runtime.worker_thread and runtime.worker_thread.is_alive()),
-            "process_id": os.getpid(),
-            "playwright_available": True,
-            "proxy_enabled": _proxy_enabled(),
-            "proxy_server": _safe_proxy_server(),
-        }
-
-
-@app.get("/v1/debug/weiq-access")
-def debug_weiq_access() -> dict[str, Any]:
-    runtime = get_runtime_manager()
+def build_task_paths(task_id: str) -> dict[str, str]:
+    task_dir = get_runtime_dir() / "tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
     return {
-        "requests": _requests_weiq_access_probe(),
-        "playwright": _playwright_weiq_access_probe(runtime.settings.runtime_dir),
-        "egress": {
-            "public_ip": _detect_public_ip(),
-            "proxy_enabled": _proxy_enabled(),
-            "proxy_server": _safe_proxy_server(),
-        },
+        "task_dir": str(task_dir.resolve()),
+        "blocked_screenshot_path": str((task_dir / "blocked_auth.png").resolve()),
     }
 
 
-@app.post("/v1/auth/session")
-def create_auth_session(request: CreateAuthSessionRequest) -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    session_id = str(uuid4())
-    session_dir = _ensure_dir(Path(runtime.settings.auth_state_dir) / session_id)
-    state_storage = str(session_dir / "storage_state.json")
-    created_at = _iso_now()
-    expires_at = (_utcnow() + timedelta(seconds=runtime.settings.auth_session_ttl_seconds)).isoformat()
-    with db_conn(runtime.settings) as conn:
-        conn.execute(
+def ensure_single_worker_mode() -> None:
+    if get_auth_mode() not in {"per_task", "browser_worker"}:
+        raise RuntimeError("当前 WEIQ API 仅支持 per_task 或 browser_worker 两种认证模式")
+    for env_name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw = os.getenv(env_name, "").strip()
+        if raw.isdigit() and int(raw) > 1:
+            raise RuntimeError("当前 WEIQ API 仅支持单 worker 进程模式启动，请使用 --workers 1")
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    progress REAL NOT NULL DEFAULT 0,
+                    current_account TEXT,
+                    current_url TEXT,
+                    page_title TEXT,
+                    screenshot_path TEXT,
+                    blocked_reason TEXT,
+                    resolution TEXT,
+                    can_resume INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT,
+                    message TEXT,
+                    input_excel TEXT NOT NULL,
+                    output_excel TEXT NOT NULL,
+                    output_dir TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    state_storage TEXT NOT NULL,
+                    headless INTEGER NOT NULL DEFAULT 0,
+                    cooldown_every INTEGER NOT NULL DEFAULT 50,
+                    cooldown_seconds INTEGER NOT NULL DEFAULT 180,
+                    retry_times INTEGER NOT NULL DEFAULT 1,
+                    retry_backoff_seconds INTEGER NOT NULL DEFAULT 3,
+                    resume INTEGER NOT NULL DEFAULT 1,
+                    run_id TEXT,
+                    total_accounts INTEGER NOT NULL DEFAULT 0,
+                    processed_accounts INTEGER NOT NULL DEFAULT 0,
+                    success_accounts INTEGER NOT NULL DEFAULT 0,
+                    failed_accounts INTEGER NOT NULL DEFAULT 0,
+                    skipped_accounts INTEGER NOT NULL DEFAULT 0,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    resume_requested INTEGER NOT NULL DEFAULT 0,
+                    login_session_id TEXT,
+                    accepted_at TEXT,
+                    picked_up_at TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    task_id TEXT,
+                    status TEXT NOT NULL,
+                    login_url TEXT,
+                    qr_image_base64 TEXT,
+                    state_storage TEXT,
+                    preview_image_path TEXT,
+                    message TEXT,
+                    expires_at TEXT,
+                    consumed_at TEXT,
+                    expired_at TEXT,
+                    cleanup_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            auth_cols = {row["name"] for row in conn.execute("PRAGMA table_info(auth_sessions)").fetchall()}
+            task_column_defs = {
+                "current_url": "TEXT",
+                "page_title": "TEXT",
+                "screenshot_path": "TEXT",
+                "blocked_reason": "TEXT",
+                "resolution": "TEXT",
+                "can_resume": "INTEGER NOT NULL DEFAULT 0",
+                "state_json": "TEXT NOT NULL DEFAULT ''",
+                "state_storage": "TEXT NOT NULL DEFAULT ''",
+                "headless": "INTEGER NOT NULL DEFAULT 0",
+                "cooldown_every": "INTEGER NOT NULL DEFAULT 50",
+                "cooldown_seconds": "INTEGER NOT NULL DEFAULT 180",
+                "retry_times": "INTEGER NOT NULL DEFAULT 1",
+                "retry_backoff_seconds": "INTEGER NOT NULL DEFAULT 3",
+                "resume": "INTEGER NOT NULL DEFAULT 1",
+                "run_id": "TEXT",
+                "total_accounts": "INTEGER NOT NULL DEFAULT 0",
+                "processed_accounts": "INTEGER NOT NULL DEFAULT 0",
+                "success_accounts": "INTEGER NOT NULL DEFAULT 0",
+                "failed_accounts": "INTEGER NOT NULL DEFAULT 0",
+                "skipped_accounts": "INTEGER NOT NULL DEFAULT 0",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+                "resume_requested": "INTEGER NOT NULL DEFAULT 0",
+                "login_session_id": "TEXT",
+                "accepted_at": "TEXT",
+                "picked_up_at": "TEXT",
+            }
+            for column_name, column_def in task_column_defs.items():
+                if column_name not in task_cols:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {column_def}")
+
+            auth_column_defs = {
+                "qr_image_base64": "TEXT",
+                "state_storage": "TEXT",
+                "preview_image_path": "TEXT",
+                "consumed_at": "TEXT",
+                "expired_at": "TEXT",
+                "cleanup_at": "TEXT",
+            }
+            for column_name, column_def in auth_column_defs.items():
+                if column_name not in auth_cols:
+                    conn.execute(f"ALTER TABLE auth_sessions ADD COLUMN {column_name} {column_def}")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_tasks_login_session_id ON tasks(login_session_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_task_id ON auth_sessions(task_id)")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def execute(sql: str, params: tuple[Any, ...] = ()) -> None:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def fetch_one(sql: str, params: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            row = conn.execute(sql, params).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def fetch_value(sql: str, params: tuple[Any, ...] = ()) -> int:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            row = conn.execute(sql, params).fetchone()
+            if row is None:
+                return 0
+            return int(row[0] or 0)
+        finally:
+            conn.close()
+
+
+def enqueue_task(task_id: str) -> bool:
+    with QUEUE_LOCK:
+        if task_id in QUEUED_TASK_IDS or task_id in ACTIVE_TASK_IDS:
+            return False
+        QUEUED_TASK_IDS.add(task_id)
+        TASK_QUEUE.put(task_id)
+        return True
+
+
+def upsert_task_event(task_id: str, updates: dict[str, Any]) -> None:
+    if not updates:
+        return
+    cols = []
+    vals = []
+    for key, value in updates.items():
+        cols.append(f"{key} = ?")
+        vals.append(value)
+    vals.append(task_id)
+    execute(f"UPDATE tasks SET {', '.join(cols)} WHERE task_id = ?", tuple(vals))
+
+
+def upsert_auth_session(session_id: str, updates: dict[str, Any]) -> None:
+    row = fetch_one("SELECT session_id FROM auth_sessions WHERE session_id = ?", (session_id,))
+    if row is None:
+        execute(
             """
             INSERT INTO auth_sessions (
-                session_id, task_id, status, login_url, message, expires_at,
-                state_storage, preview_image_path, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id, task_id, status, login_url, qr_image_base64, state_storage, preview_image_path,
+                message, expires_at, consumed_at, expired_at, cleanup_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
-                request.task_id,
-                "waiting_credentials",
-                runtime.settings.login_url,
-                "等待提交登录信息",
-                expires_at,
-                state_storage,
-                None,
-                created_at,
-                created_at,
+                updates.get("task_id"),
+                updates.get("status", "pending"),
+                updates.get("login_url"),
+                updates.get("qr_image_base64"),
+                updates.get("state_storage"),
+                updates.get("preview_image_path"),
+                updates.get("message"),
+                updates.get("expires_at"),
+                updates.get("consumed_at"),
+                updates.get("expired_at"),
+                updates.get("cleanup_at"),
+                updates.get("created_at", now_iso()),
+                updates.get("updated_at", now_iso()),
             ),
         )
+        return
+
+    if not updates:
+        return
+    cols = []
+    vals = []
+    updates = {**updates, "updated_at": updates.get("updated_at", now_iso())}
+    for key, value in updates.items():
+        cols.append(f"{key} = ?")
+        vals.append(value)
+    vals.append(session_id)
+    execute(f"UPDATE auth_sessions SET {', '.join(cols)} WHERE session_id = ?", tuple(vals))
+
+
+def fetch_auth_session(session_id: str) -> Optional[dict[str, Any]]:
+    return fetch_one("SELECT * FROM auth_sessions WHERE session_id = ?", (session_id,))
+
+
+def is_auth_session_expired(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    expires_at = parse_iso(str(row.get("expires_at") or ""))
+    return expires_at is not None and expires_at <= datetime.now()
+
+
+def write_auth_session_meta(session_id: str, payload: dict[str, Any]) -> None:
+    meta_path = Path(build_auth_session_paths(session_id)["meta_path"])
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def capture_login_preview(session_id: str, page) -> tuple[str | None, str | None]:
+    try:
+        image_bytes = page.screenshot(type="png", full_page=False)
+    except Exception:
+        return None, None
+    paths = build_auth_session_paths(session_id)
+    preview_path = Path(paths["preview_image_path"])
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(image_bytes)
+    return str(preview_path.resolve()), base64.b64encode(image_bytes).decode("utf-8")
+
+
+def capture_task_blocked_screenshot(task_id: str, page) -> str | None:
+    try:
+        image_bytes = page.screenshot(type="png", full_page=False)
+    except Exception:
+        return None
+    screenshot_path = Path(build_task_paths(task_id)["blocked_screenshot_path"])
+    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+    screenshot_path.write_bytes(image_bytes)
+    return str(screenshot_path.resolve())
+
+
+def _blocked_auth_message(reason_code: str | None = None) -> str:
+    if reason_code == ErrorCode.CAPTCHA_REQUIRED:
+        return "WEIQ 要求安全验证，请在远端浏览器中完成验证后继续。"
+    return "WEIQ 要求安全验证，请在远端浏览器中完成验证后继续。"
+
+
+def _capture_blocked_auth_context(task_id: str, page) -> dict[str, Any]:
+    current_url = None
+    page_title = None
+    if page is not None:
+        try:
+            current_url = str(page.url or "").strip() or None
+        except Exception:
+            current_url = None
+        try:
+            page_title = str(page.title() or "").strip() or None
+        except Exception:
+            page_title = None
     return {
-        "session_id": session_id,
-        "status": "waiting_credentials",
-        "login_url": runtime.settings.login_url,
-        "message": "等待提交登录信息",
-        "expires_at": expires_at,
-        "state_storage": state_storage,
+        "current_url": current_url,
+        "page_title": page_title,
+        "screenshot_path": capture_task_blocked_screenshot(task_id, page) if page is not None else None,
     }
 
 
-@app.post("/v1/auth/session/{session_id}/submit")
-def submit_auth_session(session_id: str, request: SubmitAuthSessionRequest) -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        session = _get_auth_session(conn, session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="session not found")
+def _clear_blocked_auth_context(task_id: str) -> None:
+    screenshot_path = Path(build_task_paths(task_id)["blocked_screenshot_path"])
+    if screenshot_path.exists():
+        try:
+            screenshot_path.unlink()
+        except Exception:
+            pass
 
-    status, message = _submit_auth_session_with_browser(session, request.model_dump(), runtime.settings)
-    with db_conn(runtime.settings) as conn:
-        updates: dict[str, Any] = {"status": status, "message": message}
-        if status == "expired":
-            updates["expired_at"] = _iso_now()
-        _update_row(conn, "auth_sessions", "session_id", session_id, **updates)
-        session = _get_auth_session(conn, session_id)
-    return {
-        "session_id": session_id,
+
+def _set_task_blocked_auth(
+    task_id: str,
+    *,
+    reason_code: str,
+    page=None,
+    context=None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    if context is not None:
+        try:
+            context.storage_state(path=str(get_legacy_state_json_path()))
+        except Exception:
+            pass
+    snapshot = _capture_blocked_auth_context(task_id, page)
+    updates = {
+        "status": TaskStatus.BLOCKED_AUTH,
+        "blocked_reason": reason_code,
+        "error_code": "BLOCKED_AUTH",
+        "message": message or _blocked_auth_message(reason_code),
+        "current_url": snapshot["current_url"],
+        "page_title": snapshot["page_title"],
+        "screenshot_path": snapshot["screenshot_path"],
+        "resolution": "open_browser_session" if get_auth_mode() == "browser_worker" else "submit_login_session",
+        "can_resume": 1,
+        "finished_at": None,
+    }
+    upsert_task_event(task_id, updates)
+    row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+    return build_status_payload(row or {"task_id": task_id, **updates})
+
+
+def cleanup_auth_session_directory(session_id: str) -> None:
+    if keep_auth_state_for_debug():
+        return
+    session_dir = get_auth_state_dir() / session_id
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def expire_auth_session(session_id: str, *, message: str | None = None) -> dict[str, Any]:
+    row = fetch_auth_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    unregister_active_session(session_id)
+    now = now_iso()
+    updates = {
+        "status": "expired",
+        "message": message or "本次临时登录会话已过期，请重新创建。",
+        "expired_at": now,
+        "expires_at": now,
+    }
+    if not keep_auth_state_for_debug():
+        cleanup_auth_session_directory(session_id)
+        updates["cleanup_at"] = now
+    upsert_auth_session(session_id, updates)
+    refreshed = fetch_auth_session(session_id)
+    assert refreshed is not None
+    return refreshed
+
+
+def mark_auth_session_cleaned(session_id: str, *, status: str, message: str) -> None:
+    now = now_iso()
+    updates: dict[str, Any] = {
         "status": status,
         "message": message,
-        "login_url": session["login_url"],
-        "expires_at": session["expires_at"],
-        "state_storage": session["state_storage"],
+        "consumed_at": now if status == "consumed" else None,
+        "expired_at": now if status == "expired" else None,
     }
+    unregister_active_session(session_id)
+    if not keep_auth_state_for_debug():
+        cleanup_auth_session_directory(session_id)
+        updates["cleanup_at"] = now
+    upsert_auth_session(session_id, updates)
 
 
-@app.post("/v1/auth/session/{session_id}/check")
-def check_auth_session(session_id: str) -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        session = _get_auth_session(conn, session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        status, message = _session_status_for_check(session)
-        updates: dict[str, Any] = {"status": status, "message": message}
-        if status == "expired":
-            updates["expired_at"] = _iso_now()
-        _update_row(conn, "auth_sessions", "session_id", session_id, **updates)
-        session = _get_auth_session(conn, session_id)
-    return {
-        "session_id": session_id,
-        "status": status,
-        "message": message,
-        "login_url": session["login_url"],
-        "expires_at": session["expires_at"],
-        "state_storage": session["state_storage"],
-    }
+def finalize_task_auth_session(task_id: str, task_status: str) -> None:
+    task = fetch_one("SELECT login_session_id FROM tasks WHERE task_id = ?", (task_id,))
+    session_id = str(task.get("login_session_id") or "").strip() if task else ""
+    if not session_id:
+        return
+    row = fetch_auth_session(session_id)
+    if row is None:
+        return
+    if task_status == TaskStatus.CANCELLED:
+        mark_auth_session_cleaned(session_id, status="expired", message="本次临时登录态已清理")
+        return
+    status = "consumed" if str(row.get("status") or "") == "authenticated" else "expired"
+    mark_auth_session_cleaned(session_id, status=status, message="本次临时登录态已清理")
 
 
-@app.post("/v1/auth/legacy/open-login")
-def open_legacy_login() -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    session = _open_legacy_login_browser(runtime.settings)
-    return {
-        "status": "opened",
-        "message": "已打开 legacy 登录浏览器，请在窗口中完成 WEIQ 人工登录并保持窗口打开。",
-        "login_url": session.login_url,
-        "state_json_path": session.state_json_path,
-        "headless": session.headless,
-    }
+def materialize_task_request(payload: CreateTaskRequest) -> dict[str, Any]:
+    runtime_dir = get_runtime_dir()
+    task_key = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+    task_runtime_dir = get_task_runtime_dir(task_key)
+    progress_state = str((task_runtime_dir / "crawl_progress.json").resolve())
+    placeholder_auth_state = str((task_runtime_dir / "task_auth_placeholder.json").resolve())
 
+    if payload.accounts:
+        accounts = []
+        for item in payload.accounts:
+            uid = str(item.uid or "").strip()
+            if not uid:
+                continue
+            account_id = str(item.account_id or item.nickname or uid).strip() or uid
+            accounts.append({"账号ID": account_id, "uid": uid})
+        if not accounts:
+            raise HTTPException(status_code=400, detail="accounts 不能为空，且每个账号必须带 uid")
 
-@app.post("/v1/auth/legacy/check")
-def check_legacy_login() -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    payload = _check_legacy_login_session(runtime.settings)
-    payload.update(
-        {
-            "state_json_path": str(_legacy_state_path(runtime.settings)),
-            "state_json_exists": _legacy_state_exists(runtime.settings),
+        input_dir = runtime_dir / "inputs"
+        output_dir = runtime_dir / "outputs" / task_key
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        input_excel = input_dir / f"accounts_{task_key}.xlsx"
+        pd.DataFrame(accounts).to_excel(input_excel, index=False)
+        return {
+            "input_excel": str(input_excel.resolve()),
+            "output_excel": f"weiq_results_{task_key}.xlsx",
+            "output_dir": str(output_dir.resolve()),
+            "state_json": progress_state,
+            "state_storage": placeholder_auth_state,
+            "headless": payload.headless if payload.headless is not None else True,
+            "cooldown_every": payload.cooldown_every,
+            "cooldown_seconds": payload.cooldown_seconds,
+            "retry_times": payload.retry_times,
+            "retry_backoff_seconds": payload.retry_backoff_seconds,
+            "resume": payload.resume,
         }
+
+    input_excel = str(payload.input_excel or "").strip()
+    if not input_excel:
+        raise HTTPException(status_code=400, detail="缺少 input_excel，或请改用 accounts JSON 模式")
+    output_dir = str(payload.output_dir or runtime_dir).strip() or str(runtime_dir)
+    output_excel = str(payload.output_excel or f"weiq_results_{task_key}.xlsx").strip()
+    state_json = str(payload.state_json or progress_state).strip()
+    state_storage = str(payload.state_storage or placeholder_auth_state).strip()
+    return {
+        "input_excel": input_excel,
+        "output_excel": output_excel,
+        "output_dir": output_dir,
+        "state_json": state_json,
+        "state_storage": state_storage,
+        "headless": payload.headless if payload.headless is not None else True,
+        "cooldown_every": payload.cooldown_every,
+        "cooldown_seconds": payload.cooldown_seconds,
+        "retry_times": payload.retry_times,
+        "retry_backoff_seconds": payload.retry_backoff_seconds,
+        "resume": payload.resume,
+    }
+
+
+def build_status_payload(row: dict[str, Any]) -> dict[str, Any]:
+    status = row.get("status", TaskStatus.PENDING)
+    error_code = row.get("error_code") or ErrorCode.NONE
+    message = row.get("message") or None
+    auth_session_status = None
+    login_session_id = str(row.get("login_session_id") or "").strip()
+    if login_session_id:
+        auth_session = fetch_auth_session(login_session_id)
+        auth_session_status = str(auth_session.get("status") or "").strip() if auth_session else None
+    export_file = None
+    output_excel = str(row.get("output_excel") or "").strip()
+    output_dir = str(row.get("output_dir") or "").strip()
+    if output_excel:
+        output_path = Path(output_excel)
+        if not output_path.is_absolute():
+            output_path = Path(output_dir or ".") / output_path
+        export_file = str(output_path.resolve())
+    if message and (error_code == ErrorCode.NONE or status in {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED_AUTH}):
+        error_message_zh = message
+    else:
+        error_message_zh = ERROR_MESSAGES_ZH.get(error_code, message or error_code)
+    accepted_at = str(row.get("accepted_at") or row.get("created_at") or "").strip() or None
+    picked_up_at = str(row.get("picked_up_at") or row.get("started_at") or "").strip() or None
+    queue_age_seconds = None
+    accepted_dt = parse_iso(accepted_at)
+    picked_up_dt = parse_iso(picked_up_at)
+    if accepted_dt is not None:
+        if status == TaskStatus.PENDING and picked_up_dt is None:
+            queue_age_seconds = max(0, int((datetime.now() - accepted_dt).total_seconds()))
+        elif picked_up_dt is not None:
+            queue_age_seconds = max(0, int((picked_up_dt - accepted_dt).total_seconds()))
+    with QUEUE_LOCK:
+        queue_size = TASK_QUEUE.qsize()
+    worker_alive = bool(WORKER_THREAD and WORKER_THREAD.is_alive())
+    needs_login = bool(
+        status == TaskStatus.BLOCKED_AUTH
+        or auth_session_status in AUTH_WAITING_STATUSES
     )
-    return payload
+    resolution = str(row.get("resolution") or "").strip() or None
+    if status == TaskStatus.BLOCKED_AUTH and not resolution:
+        resolution = "open_browser_session" if get_auth_mode() == "browser_worker" else "submit_login_session"
+    return {
+        **row,
+        "status_zh": STATUS_ZH.get(status, status),
+        "error_message_zh": error_message_zh,
+        "auth_waiting": needs_login,
+        "export_file": export_file,
+        "accepted_at": accepted_at,
+        "picked_up_at": picked_up_at,
+        "queue_age_seconds": queue_age_seconds,
+        "worker_alive": worker_alive,
+        "queue_size": queue_size,
+        "auth_session_status": auth_session_status,
+        "needs_login": needs_login,
+        "current_url": str(row.get("current_url") or "").strip() or None,
+        "page_title": str(row.get("page_title") or "").strip() or None,
+        "screenshot_path": str(row.get("screenshot_path") or "").strip() or None,
+        "resolution": resolution,
+        "can_resume": bool(row.get("can_resume", 0)),
+    }
 
 
-@app.post("/v1/tasks/crawl")
-def create_crawl_task(request: CrawlTaskRequest) -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    accounts = [item.model_dump() for item in request.accounts]
-    if not accounts:
-        raise HTTPException(status_code=400, detail="accounts is required")
+def _is_process_running(proc: object | None) -> bool:
+    if proc is None:
+        return False
+    poll = getattr(proc, "poll", None)
+    if callable(poll):
+        try:
+            return poll() is None
+        except Exception:
+            return False
+    pid = _normalize_pid(proc)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
-    with db_conn(runtime.settings) as conn:
-        browser_auth_mode = runtime.settings.browser_auth_mode
-        session = None
-        state_storage = runtime.settings.legacy_state_json if browser_auth_mode == "legacy_state" else None
-        headless = runtime.settings.legacy_headless if browser_auth_mode == "legacy_state" else request.headless
-        if browser_auth_mode == "legacy_state":
-            if not _legacy_state_usable(runtime.settings):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "BLOCKED_AUTH: 请先调用 /v1/auth/legacy/open-login，在打开的浏览器中完成 WEIQ 登录，"
-                        "然后调用 /v1/auth/legacy/check 保存 state.json。"
-                    ),
-                )
-        else:
-            if not request.login_session_id:
-                raise HTTPException(status_code=400, detail="login_session_id is required")
-            session = _get_auth_session(conn, request.login_session_id)
-            if session is None:
-                raise HTTPException(status_code=404, detail="login session not found")
-            status, _ = _session_status_for_check(session)
-            if status != "authenticated":
-                raise HTTPException(status_code=400, detail="login session is not authenticated")
-            state_storage = session["state_storage"]
 
-        task_id = str(uuid4())
-        output_dir = str(_ensure_dir(Path(runtime.settings.runtime_dir) / "tasks" / task_id))
-        input_excel = str(Path(output_dir) / "accounts.xlsx")
-        output_excel = str(Path(output_dir) / "weiq_results.xlsx")
-        _write_accounts_excel(input_excel, accounts)
-        created_at = _iso_now()
-        conn.execute(
-            """
-            INSERT INTO tasks (
-                task_id, status, progress, current_account, total_accounts, processed_accounts,
-                success_accounts, failed_accounts, skipped_accounts, message, error_code,
-                input_excel, output_excel, output_dir, state_storage, headless, login_session_id,
-                accounts_json, retry_times, retry_backoff_seconds, resume, created_at, started_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                TaskStatus.PENDING.value,
-                0.0,
-                None,
-                len(accounts),
-                0,
-                0,
-                0,
-                0,
-                "任务已创建，等待 worker 执行",
-                None,
-                input_excel,
-                output_excel,
-                output_dir,
-                state_storage,
-                1 if headless else 0,
-                request.login_session_id if browser_auth_mode != "legacy_state" else None,
-                json.dumps(accounts, ensure_ascii=False),
-                request.retry_times,
-                request.retry_backoff_seconds,
-                1 if request.resume else 0,
-                created_at,
-                None,
-                None,
-            ),
+def _normalize_pid(value: object) -> int | None:
+    if isinstance(value, subprocess.Popen):
+        return value.pid
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value or "").strip()
+    if text.isdigit():
+        pid = int(text)
+        return pid if pid > 0 else None
+    return None
+
+
+def _display_socket_path(display: str | None) -> Path | None:
+    text = str(display or "").strip()
+    if not text.startswith(":"):
+        return None
+    display_number = text[1:].split(".", 1)[0].strip()
+    if not display_number.isdigit():
+        return None
+    return Path("/tmp/.X11-unix") / f"X{display_number}"
+
+
+def _is_display_ready(display: str | None) -> bool:
+    socket_path = _display_socket_path(display)
+    return socket_path is not None and socket_path.exists()
+
+
+def _read_process_table() -> list[tuple[int, str]]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        if session is not None and request.login_session_id:
-            conn.execute(
-                "UPDATE auth_sessions SET task_id = ?, updated_at = ? WHERE session_id = ?",
-                (task_id, _iso_now(), request.login_session_id),
+    except Exception:
+        return []
+
+    rows: list[tuple[int, str]] = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if not parts or not parts[0].isdigit():
+            continue
+        rows.append((int(parts[0]), parts[1] if len(parts) > 1 else ""))
+    return rows
+
+
+def _find_process_pid(*needles: str) -> int | None:
+    required = [needle for needle in needles if needle]
+    if not required:
+        return None
+    for pid, args in _read_process_table():
+        if all(needle in args for needle in required):
+            return pid
+    return None
+
+
+def _discover_existing_browser_worker_runtime(existing: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    seed = dict(existing or {})
+    display = str(seed.get("display") or get_browser_display()).strip() or get_browser_display()
+    vnc_port = int(seed.get("vnc_port") or get_browser_vnc_port())
+    novnc_port = int(seed.get("novnc_port") or get_browser_novnc_port())
+    xvfb_proc = seed.get("xvfb_proc")
+    x11vnc_proc = seed.get("x11vnc_proc")
+    websockify_proc = seed.get("websockify_proc")
+
+    if not _is_process_running(xvfb_proc):
+        xvfb_proc = _find_process_pid("Xvfb", display)
+    if not _is_process_running(x11vnc_proc):
+        x11vnc_proc = _find_process_pid("x11vnc", display, str(vnc_port))
+    if not _is_process_running(websockify_proc):
+        websockify_proc = _find_process_pid("websockify", f"127.0.0.1:{novnc_port}", f"127.0.0.1:{vnc_port}")
+
+    if not any((xvfb_proc, x11vnc_proc, websockify_proc)):
+        return None
+
+    runtime_env = dict(seed.get("runtime_env") or os.environ.copy())
+    runtime_env["DISPLAY"] = display
+    runtime = {
+        "session_id": seed.get("session_id"),
+        "playwright": seed.get("playwright"),
+        "context": seed.get("context"),
+        "page": seed.get("page"),
+        "opened_at": seed.get("opened_at") or now_iso(),
+        "expires_at": seed.get("expires_at"),
+        "display": display,
+        "runtime_env": runtime_env,
+        "vnc_port": vnc_port,
+        "novnc_port": novnc_port,
+        "novnc_local_url": seed.get("novnc_local_url") or f"http://127.0.0.1:{novnc_port}/vnc.html?path=websockify",
+        "xvfb_proc": xvfb_proc,
+        "x11vnc_proc": x11vnc_proc,
+        "websockify_proc": websockify_proc,
+    }
+    return runtime
+
+
+def _wait_for_local_port(port: int, *, timeout_seconds: float = 8.0) -> None:
+    deadline = time.time() + timeout_seconds
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            time.sleep(0.2)
+    raise RuntimeError(f"本地端口 127.0.0.1:{port} 未能按时启动：{last_error}")
+
+
+def _terminate_process(proc: object | None) -> None:
+    if proc is None:
+        return
+    terminate = getattr(proc, "terminate", None)
+    wait = getattr(proc, "wait", None)
+    kill = getattr(proc, "kill", None)
+    poll = getattr(proc, "poll", None)
+    if callable(terminate) and callable(wait) and callable(kill) and callable(poll):
+        try:
+            if poll() is None:
+                terminate()
+                wait(timeout=5)
+        except Exception:
+            try:
+                kill()
+                wait(timeout=3)
+            except Exception:
+                pass
+        return
+    if not isinstance(proc, subprocess.Popen):
+        pid = _normalize_pid(proc)
+        if pid is None:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not _is_process_running(pid):
+                return
+            time.sleep(0.1)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            return
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+
+def _launch_local_process(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        text=True,
+    )
+
+
+def _ensure_browser_worker_support_files() -> None:
+    for binary in ("Xvfb", "x11vnc", "websockify"):
+        if shutil.which(binary) is None:
+            raise RuntimeError(f"缺少依赖：{binary}")
+    novnc_dir = get_novnc_web_dir()
+    if not (novnc_dir / "vnc.html").exists():
+        raise RuntimeError(f"noVNC 静态目录不可用：{novnc_dir}")
+
+
+def _close_browser_worker_display_runtime() -> None:
+    with BROWSER_WORKER_LOCK:
+        runtime = BROWSER_WORKER_RUNTIME.pop("session", None)
+    if not runtime:
+        return
+    for key in ("websockify_proc", "x11vnc_proc", "xvfb_proc"):
+        _terminate_process(runtime.get(key))
+
+
+def _browser_worker_runtime_snapshot() -> dict[str, Any] | None:
+    with BROWSER_WORKER_LOCK:
+        runtime = BROWSER_WORKER_RUNTIME.get("session")
+        snapshot = dict(runtime) if runtime is not None else None
+
+    discovered = _discover_existing_browser_worker_runtime(snapshot)
+    if discovered is None:
+        return snapshot
+
+    with BROWSER_WORKER_LOCK:
+        current = BROWSER_WORKER_RUNTIME.get("session")
+        if current is None:
+            BROWSER_WORKER_RUNTIME["session"] = discovered
+            current = BROWSER_WORKER_RUNTIME["session"]
+        else:
+            current.update(
+                {
+                    "display": discovered.get("display"),
+                    "runtime_env": discovered.get("runtime_env"),
+                    "vnc_port": discovered.get("vnc_port"),
+                    "novnc_port": discovered.get("novnc_port"),
+                    "novnc_local_url": discovered.get("novnc_local_url"),
+                    "xvfb_proc": discovered.get("xvfb_proc"),
+                    "x11vnc_proc": discovered.get("x11vnc_proc"),
+                    "websockify_proc": discovered.get("websockify_proc"),
+                }
             )
-    runtime.enqueue(task_id)
-    return {"task_id": task_id, "status": TaskStatus.PENDING.value, "progress": 0.0, "message": "任务已创建"}
+        return dict(current)
+
+
+def _browser_worker_processes_running(runtime: dict[str, Any] | None) -> bool:
+    if not runtime:
+        return False
+    return all(_is_process_running(runtime.get(key)) for key in ("xvfb_proc", "x11vnc_proc", "websockify_proc"))
+
+
+def _browser_worker_browser_running(runtime: dict[str, Any] | None) -> bool:
+    controller = globals().get("BROWSER_WORKER_CONTROLLER")
+    snapshot = controller.public_snapshot() if controller is not None else {}
+    return bool(snapshot.get("browser_session_running")) and bool(
+        runtime and _is_process_running(runtime.get("xvfb_proc"))
+    )
+
+
+def _browser_worker_status_payload(*, message: str | None = None) -> dict[str, Any]:
+    state_path = get_legacy_state_json_path()
+    saved_auth_state_present = has_usable_storage_state(str(state_path))
+    runtime = _browser_worker_runtime_snapshot()
+    controller = globals().get("BROWSER_WORKER_CONTROLLER")
+    controller_state = controller.public_snapshot() if controller is not None else {}
+    worker_open = _browser_worker_browser_running(runtime)
+    configured_display = get_browser_display() if get_auth_mode() == "browser_worker" else None
+    browser_display = str(runtime.get("display") or configured_display or "").strip() if runtime else configured_display
+    xvfb_running = _is_process_running(runtime.get("xvfb_proc")) if runtime else False
+    x11vnc_running = _is_process_running(runtime.get("x11vnc_proc")) if runtime else False
+    websockify_running = _is_process_running(runtime.get("websockify_proc")) if runtime else False
+    display_ready = xvfb_running and _is_display_ready(browser_display)
+    novnc_running = x11vnc_running and websockify_running
+    crawl_will_use_display = get_auth_mode() == "browser_worker" and not get_browser_headless()
+    live_auth_verified = bool(controller_state.get("live_auth_verified")) and worker_open
+    login_status = (
+        "authenticated"
+        if live_auth_verified
+        else "waiting_login"
+        if worker_open
+        else "saved_state_unverified"
+        if saved_auth_state_present
+        else "auth_required"
+    )
+    effective_message = message
+    if not effective_message:
+        if live_auth_verified:
+            effective_message = "已实时验证 WEIQ 登录，Browser Worker 可用"
+        elif worker_open:
+            effective_message = "远端浏览器已打开，请完成 WEIQ 登录或安全验证后再检查"
+        elif saved_auth_state_present:
+            effective_message = "发现可复用登录态，但尚未通过远端浏览器实时验证"
+        else:
+            effective_message = "请在 Browser Worker 登录窗口中完成 WEIQ 登录"
+    return {
+        "auth_mode": get_auth_mode(),
+        "authenticated": saved_auth_state_present,
+        "state_json_exists": state_path.exists(),
+        "saved_auth_state_present": saved_auth_state_present,
+        "live_auth_verified": live_auth_verified,
+        "runtime_state": str(controller_state.get("runtime_state") or ("open" if worker_open else "closed")),
+        "worker_available": True,
+        "login_status": login_status,
+        "browser_session_running": worker_open,
+        "novnc_running": novnc_running,
+        "browser_display": browser_display or None,
+        "display_ready": display_ready,
+        "xvfb_running": xvfb_running,
+        "x11vnc_running": x11vnc_running,
+        "websockify_running": websockify_running,
+        "crawl_will_use_display": crawl_will_use_display,
+        "session_id": str(controller_state.get("session_id") or "") if worker_open else None,
+        "novnc_local_url": str(runtime.get("novnc_local_url") or "") if runtime else None,
+        "novnc_proxy_path": get_browser_proxy_path(),
+        "expires_at": str(controller_state.get("expires_at") or "") or None,
+        "blocked": bool(controller_state.get("blocked")),
+        "page_title": controller_state.get("page_title"),
+        "message": effective_message,
+    }
+
+
+def _ensure_browser_worker_display_runtime() -> dict[str, Any]:
+    runtime = _browser_worker_runtime_snapshot() or {}
+    _ensure_browser_worker_support_files()
+    display = str(runtime.get("display") or get_browser_display()).strip() or get_browser_display()
+    screen = get_browser_screen_geometry()
+    vnc_port = int(runtime.get("vnc_port") or get_browser_vnc_port())
+    novnc_port = int(runtime.get("novnc_port") or get_browser_novnc_port())
+    runtime_env = dict(runtime.get("runtime_env") or os.environ.copy())
+    runtime_env["DISPLAY"] = display
+
+    started_handles: list[object] = []
+    try:
+        xvfb_proc = runtime.get("xvfb_proc")
+        if not _is_process_running(xvfb_proc):
+            xvfb_proc = _launch_local_process(["Xvfb", display, "-screen", "0", screen, "-nolisten", "tcp"])
+            started_handles.append(xvfb_proc)
+            time.sleep(1.0)
+            if not _is_process_running(xvfb_proc):
+                raise RuntimeError("Xvfb 启动失败")
+        runtime["xvfb_proc"] = xvfb_proc
+
+        x11vnc_proc = runtime.get("x11vnc_proc")
+        if not _is_process_running(x11vnc_proc):
+            x11vnc_proc = _launch_local_process(
+                [
+                    "x11vnc",
+                    "-display",
+                    display,
+                    "-localhost",
+                    "-rfbport",
+                    str(vnc_port),
+                    "-forever",
+                    "-shared",
+                    "-nopw",
+                    "-xkb",
+                ],
+                env=runtime_env,
+            )
+            started_handles.append(x11vnc_proc)
+            _wait_for_local_port(vnc_port)
+        runtime["x11vnc_proc"] = x11vnc_proc
+
+        websockify_proc = runtime.get("websockify_proc")
+        if not _is_process_running(websockify_proc):
+            websockify_proc = _launch_local_process(
+                [
+                    "websockify",
+                    f"127.0.0.1:{novnc_port}",
+                    f"127.0.0.1:{vnc_port}",
+                    "--web",
+                    str(get_novnc_web_dir()),
+                ],
+                env=runtime_env,
+            )
+            started_handles.append(websockify_proc)
+            _wait_for_local_port(novnc_port)
+        runtime["websockify_proc"] = websockify_proc
+
+        runtime.update(
+            {
+                "opened_at": runtime.get("opened_at") or now_iso(),
+                "display": display,
+                "runtime_env": runtime_env,
+                "vnc_port": vnc_port,
+                "novnc_port": novnc_port,
+                "novnc_local_url": runtime.get("novnc_local_url")
+                or f"http://127.0.0.1:{novnc_port}/vnc.html?path=websockify",
+            }
+        )
+        with BROWSER_WORKER_LOCK:
+            current = BROWSER_WORKER_RUNTIME.get("session")
+            if current is None:
+                BROWSER_WORKER_RUNTIME["session"] = runtime
+                current = BROWSER_WORKER_RUNTIME["session"]
+            else:
+                current.update(runtime)
+            return current
+    except Exception:
+        for handle in reversed(started_handles):
+            _terminate_process(handle)
+        raise
+
+
+def ensure_browser_display() -> str:
+    if get_auth_mode() != "browser_worker" or get_browser_headless():
+        return ""
+    try:
+        runtime = _ensure_browser_worker_display_runtime()
+    except Exception as exc:
+        raise RuntimeError(BROWSER_DISPLAY_UNAVAILABLE_MESSAGE) from exc
+
+    display = str(runtime.get("display") or "").strip()
+    if not display or not _is_process_running(runtime.get("xvfb_proc")) or not _is_display_ready(display):
+        raise RuntimeError(BROWSER_DISPLAY_UNAVAILABLE_MESSAGE)
+    return display
+
+
+class BrowserWorkerStartupError(RuntimeError):
+    def __init__(self, stage: str, cause: Exception) -> None:
+        self.stage = stage
+        self.cause = cause
+        super().__init__(f"Browser Worker 启动失败（{stage}）：{cause}")
+
+
+async def _infer_async_browser_auth_requirement(page: Any) -> tuple[bool, str, str | None]:
+    page_title = None
+    body_text = ""
+    try:
+        page_title = str(await page.title() or "").strip() or None
+    except Exception:
+        pass
+    try:
+        body_text = str(await page.locator("body").inner_text(timeout=2000) or "")
+    except Exception:
+        pass
+    page_url = str(getattr(page, "url", "") or "")
+    merged = f"{page_url}\n{page_title or ''}\n{body_text}".lower()
+    if any(marker in merged for marker in ("安全验证", "验证码", "captcha", "challenge", "url you requested has been blocked")):
+        return True, ErrorCode.CAPTCHA_REQUIRED, page_title
+    try:
+        login_fields = await page.locator(
+            "input[type='password'], input[placeholder*='登录'], input[placeholder*='手机号'], input[placeholder*='验证码']"
+        ).count()
+    except Exception:
+        login_fields = 0
+    if login_fields or any(marker in page_url.lower() for marker in ("login", "passport", "signin")):
+        return True, ErrorCode.AUTH_REQUIRED, page_title
+    return False, ErrorCode.NONE, page_title
+
+
+class BrowserWorkerController:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._playwright: Any = None
+        self._context: Any = None
+        self._page: Any = None
+        self._expiry_task: asyncio.Task[None] | None = None
+        self._state: dict[str, Any] = {
+            "runtime_state": "closed",
+            "browser_session_running": False,
+            "live_auth_verified": False,
+        }
+
+    def public_snapshot(self) -> dict[str, Any]:
+        return dict(self._state)
+
+    def _set_state(self, **updates: Any) -> None:
+        self._state.update(updates)
+
+    async def open(self) -> dict[str, Any]:
+        async with self._lock:
+            if self._context is not None and self._page is not None:
+                self._renew_expiry_locked()
+                return _browser_worker_status_payload(message="远端浏览器窗口已打开")
+
+            await self._close_locked(close_display=True)
+            stage = "display"
+            self._set_state(runtime_state="starting", browser_session_running=False, live_auth_verified=False)
+            try:
+                runtime = await asyncio.to_thread(_ensure_browser_worker_display_runtime)
+                display = str(runtime.get("display") or get_browser_display()).strip() or get_browser_display()
+                runtime_env = dict(runtime.get("runtime_env") or os.environ.copy())
+                runtime_env["DISPLAY"] = display
+
+                stage = "playwright"
+                self._playwright = await async_playwright().start()
+                stage = "chromium"
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(get_browser_user_data_dir()),
+                    headless=False,
+                    args=["--start-maximized"],
+                    env=runtime_env,
+                )
+                pages = list(self._context.pages)
+                self._page = pages[0] if pages else await self._context.new_page()
+                stage = "navigation"
+                try:
+                    await self._page.goto("https://www.weiq.com/", timeout=45000, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+
+                session_id = uuid4().hex
+                self._set_state(
+                    session_id=session_id,
+                    runtime_state="open",
+                    browser_session_running=True,
+                    live_auth_verified=False,
+                    blocked=False,
+                    page_title=None,
+                )
+                self._renew_expiry_locked()
+                return _browser_worker_status_payload(message="Browser Worker 登录窗口已打开，请在远程浏览器里完成 WEIQ 登录")
+            except Exception as exc:
+                await self._close_locked(close_display=True)
+                self._set_state(runtime_state="failed", last_error=str(exc))
+                raise BrowserWorkerStartupError(stage, exc) from exc
+
+    async def status(self) -> dict[str, Any]:
+        async with self._lock:
+            return _browser_worker_status_payload()
+
+    async def check(self) -> dict[str, Any]:
+        async with self._lock:
+            if self._context is None or self._page is None:
+                self._set_state(live_auth_verified=False, runtime_state="closed")
+                return _browser_worker_status_payload()
+
+            state_path = get_legacy_state_json_path()
+            try:
+                await self._context.storage_state(path=str(state_path))
+            except Exception:
+                pass
+            needs_auth, reason_code, page_title = await _infer_async_browser_auth_requirement(self._page)
+            verified = not needs_auth and has_usable_storage_state(str(state_path))
+            self._set_state(
+                live_auth_verified=verified,
+                blocked=reason_code in {ErrorCode.HTTP_BLOCKED, ErrorCode.CAPTCHA_REQUIRED},
+                page_title=page_title,
+                runtime_state="verified" if verified else "waiting_login",
+            )
+            return _browser_worker_status_payload(
+                message="已实时验证 WEIQ 登录，Browser Worker 已保存长期登录态"
+                if verified
+                else "远端浏览器仍在等待 WEIQ 登录或安全验证"
+            )
+
+    async def close(self, *, session_id: str | None = None) -> dict[str, Any]:
+        async with self._lock:
+            if session_id and session_id != self._state.get("session_id"):
+                return _browser_worker_status_payload()
+            await self._close_locked(close_display=True)
+            return _browser_worker_status_payload(message="Browser Worker 登录窗口已关闭")
+
+    async def resume_task_after_auth(self, task_id: str) -> dict[str, Any]:
+        async with self._lock:
+            if self._context is None or self._page is None:
+                raise HTTPException(status_code=409, detail="远端浏览器会话未打开，请先打开 WEIQ 验证窗口。")
+            try:
+                await self._context.storage_state(path=str(get_legacy_state_json_path()))
+            except Exception:
+                pass
+            needs_auth, reason_code, page_title = await _infer_async_browser_auth_requirement(self._page)
+            verified = not needs_auth and has_usable_storage_state(str(get_legacy_state_json_path()))
+            self._set_state(
+                live_auth_verified=verified,
+                blocked=reason_code in {ErrorCode.HTTP_BLOCKED, ErrorCode.CAPTCHA_REQUIRED},
+                page_title=page_title,
+                runtime_state="verified" if verified else "waiting_login",
+            )
+            if not verified:
+                updates = {
+                    "status": TaskStatus.BLOCKED_AUTH,
+                    "blocked_reason": reason_code if needs_auth else ErrorCode.AUTH_REQUIRED,
+                    "error_code": "BLOCKED_AUTH",
+                    "message": "WEIQ 验证尚未完成，请先在远端浏览器中完成验证后再继续抓取。",
+                    "current_url": str(getattr(self._page, "url", "") or "").strip() or None,
+                    "page_title": page_title,
+                    "resolution": "open_browser_session",
+                    "can_resume": 1,
+                    "finished_at": None,
+                }
+                upsert_task_event(task_id, updates)
+                row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+                return build_status_payload(row or {"task_id": task_id, **updates})
+
+            _clear_blocked_auth_context(task_id)
+            upsert_task_event(
+                task_id,
+                {
+                    "status": TaskStatus.PENDING,
+                    "blocked_reason": None,
+                    "error_code": ErrorCode.NONE,
+                    "message": "已完成 WEIQ 安全验证，任务已重新入队继续执行。",
+                    "current_url": str(getattr(self._page, "url", "") or "").strip() or None,
+                    "page_title": page_title,
+                    "screenshot_path": None,
+                    "resolution": None,
+                    "can_resume": 0,
+                    "finished_at": None,
+                    "resume_requested": 1,
+                    "cancel_requested": 0,
+                },
+            )
+            enqueue_task(task_id)
+            row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            return build_status_payload(row or {"task_id": task_id, "status": TaskStatus.PENDING})
+
+    def _renew_expiry_locked(self) -> None:
+        if self._expiry_task is not None:
+            self._expiry_task.cancel()
+        ttl_seconds = get_browser_session_ttl_seconds()
+        expires_at = (datetime.now() + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+        session_id = str(self._state.get("session_id") or "")
+        self._set_state(expires_at=expires_at)
+        self._expiry_task = asyncio.create_task(self._expire_after(session_id, ttl_seconds))
+
+    async def _expire_after(self, session_id: str, ttl_seconds: int) -> None:
+        try:
+            await asyncio.sleep(ttl_seconds)
+            await self.close(session_id=session_id)
+        except asyncio.CancelledError:
+            return
+
+    async def _close_locked(self, *, close_display: bool) -> None:
+        current_task = asyncio.current_task()
+        if self._expiry_task is not None and self._expiry_task is not current_task:
+            self._expiry_task.cancel()
+        self._expiry_task = None
+        context, playwright_ctx = self._context, self._playwright
+        self._context = None
+        self._page = None
+        self._playwright = None
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if playwright_ctx is not None:
+            try:
+                await playwright_ctx.stop()
+            except Exception:
+                pass
+        if close_display:
+            await asyncio.to_thread(_close_browser_worker_display_runtime)
+        self._state = {
+            "runtime_state": "closed",
+            "browser_session_running": False,
+            "live_auth_verified": False,
+        }
+
+
+BROWSER_WORKER_CONTROLLER = BrowserWorkerController()
+
+
+def is_cancel_requested(task_id: str) -> bool:
+    row = fetch_one("SELECT cancel_requested FROM tasks WHERE task_id = ?", (task_id,))
+    return bool(row and row["cancel_requested"])
+
+
+def capture_login_screen_base64(page) -> str | None:
+    try:
+        image_bytes = page.screenshot(type="png", full_page=False)
+        return base64.b64encode(image_bytes).decode("utf-8")
+    except Exception:
+        return None
+
+
+def build_auth_session_response(row: dict[str, Any]) -> AuthSessionResponse:
+    image_base64 = row.get("qr_image_base64")
+    return AuthSessionResponse(
+        session_id=row["session_id"],
+        status=row["status"],
+        login_url=row.get("login_url"),
+        page_image_url=None,
+        page_image_base64=image_base64,
+        qr_image_url=None,
+        qr_image_base64=image_base64,
+        message=row.get("message"),
+        expires_at=row.get("expires_at"),
+        task_id=row.get("task_id"),
+    )
+
+
+def _close_active_session_runtime(session: dict[str, Any] | None) -> None:
+    if not session:
+        return
+    for resource in (session.get("browser"), session.get("playwright")):
+        if resource is None:
+            continue
+        try:
+            close_fn = getattr(resource, "close", None) or getattr(resource, "stop", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            pass
+
+
+def infer_auth_session_state(page, reason_code: str) -> tuple[str, str]:
+    page_text = ""
+    try:
+        page_text = page.locator("body").inner_text(timeout=1500)
+    except Exception:
+        page_text = ""
+    merged = f"{page.url}\n{page_text}".lower()
+    if any(keyword in merged for keyword in ["验证码", "校验码", "短信", "手机验证", "安全验证"]):
+        if "发送验证码" in page_text or "获取验证码" in page_text:
+            return "waiting_code", "WEIQ 需要手机验证码，请先发送验证码，再输入收到的验证码继续。"
+        return "waiting_code", "WEIQ 正在等待验证码或安全验证，请完成后继续。"
+    if any(keyword in merged for keyword in ["密码登录", "账号密码", "手机号登录", "登录"]):
+        return "waiting_credentials", "WEIQ 需要登录，请填写账号密码，或切换到手机验证码登录。"
+    if reason_code == ErrorCode.CAPTCHA_REQUIRED:
+        return "waiting_code", ERROR_MESSAGES_ZH.get(reason_code, "等待验证处理")
+    return "waiting_credentials", ERROR_MESSAGES_ZH.get(reason_code, "等待登录处理")
+
+
+def _build_eager_auth_session_state(
+    *,
+    session_id: str,
+    task_id: str | None,
+    state_storage: str,
+    headless: bool,
+    login_url: str = "https://www.weiq.com/",
+) -> dict[str, Any]:
+    playwright_ctx = sync_playwright().start()
+    browser, context, page = init_browser(playwright_ctx, state_storage, headless)
+    try:
+        page.goto(login_url, timeout=45000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+
+    preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+    is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_storage)
+    if is_authenticated:
+        try:
+            context.storage_state(path=state_storage)
+        except Exception:
+            pass
+        row = {
+            "task_id": task_id,
+            "status": "authenticated",
+            "login_url": page.url or login_url,
+            "state_storage": state_storage,
+            "preview_image_path": preview_image_path,
+            "qr_image_base64": None,
+            "message": "本次抓取临时 WEIQ 登录成功",
+            "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
+        }
+        upsert_auth_session(session_id, row)
+        write_auth_session_meta(session_id, {"session_id": session_id, "task_id": task_id, "state_storage": state_storage})
+        _close_active_session_runtime({"browser": browser, "playwright": playwright_ctx})
+        return fetch_auth_session(session_id) or row
+
+    status_text, message = infer_auth_session_state(page, reason_code)
+    row = {
+        "task_id": task_id,
+        "status": status_text,
+        "login_url": page.url or login_url,
+        "state_storage": state_storage,
+        "preview_image_path": preview_image_path,
+        "qr_image_base64": preview_base64,
+        "message": pending_message or message or "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+        "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+    }
+    upsert_auth_session(session_id, row)
+    write_auth_session_meta(session_id, {"session_id": session_id, "task_id": task_id, "state_storage": state_storage})
+    register_active_session(
+        session_id,
+        task_id=task_id or "",
+        page=page,
+        context=context,
+        state_storage=state_storage,
+        login_url=page.url or login_url,
+        browser=browser,
+        playwright=playwright_ctx,
+    )
+    return fetch_auth_session(session_id) or row
+
+
+def iter_login_targets(page) -> list[Any]:
+    targets: list[Any] = [page]
+    try:
+        for frame in page.frames:
+            if frame not in targets:
+                targets.append(frame)
+    except Exception:
+        pass
+    return targets
+
+
+def find_first_visible(targets: list[Any], selectors: list[str]):
+    for target in targets:
+        for selector in selectors:
+            try:
+                locator = target.locator(selector)
+                count = min(locator.count(), 6)
+                for index in range(count):
+                    candidate = locator.nth(index)
+                    if candidate.is_visible():
+                        return candidate
+            except Exception:
+                continue
+    return None
+
+
+def fill_first_visible(targets: list[Any], selectors: list[str], value: str) -> bool:
+    locator = find_first_visible(targets, selectors)
+    if locator is None:
+        return False
+    locator.click()
+    locator.fill("")
+    locator.fill(value)
+    return True
+
+
+def click_first_visible(targets: list[Any], selectors: list[str]) -> bool:
+    locator = find_first_visible(targets, selectors)
+    if locator is None:
+        return False
+    locator.click()
+    return True
+
+
+def click_first_text(targets: list[Any], texts: list[str]) -> bool:
+    selector_pool: list[str] = []
+    for text in texts:
+        selector_pool.extend(
+            [
+                f"button:has-text('{text}')",
+                f"[role='button']:has-text('{text}')",
+                f"a:has-text('{text}')",
+                f"text={text}",
+            ]
+        )
+    return click_first_visible(targets, selector_pool)
+
+
+USERNAME_SELECTORS = [
+    "input[placeholder*='手机号']",
+    "input[placeholder*='手机号码']",
+    "input[placeholder*='账号']",
+    "input[placeholder*='用户名']",
+    "input[placeholder*='登录账号']",
+    "input[name*='mobile' i]",
+    "input[name*='phone' i]",
+    "input[name*='user' i]",
+    "input[name*='account' i]",
+    "input[type='tel']",
+    "input[type='text']",
+]
+PASSWORD_SELECTORS = [
+    "input[type='password']",
+    "input[placeholder*='密码']",
+    "input[name*='password' i]",
+    "input[name*='pwd' i]",
+]
+CODE_SELECTORS = [
+    "input[placeholder*='验证码']",
+    "input[placeholder*='校验码']",
+    "input[name*='code' i]",
+    "input[name*='verify' i]",
+    "input[name*='sms' i]",
+]
+PASSWORD_TAB_TEXTS = ["账号密码登录", "密码登录", "账号登录"]
+PHONE_TAB_TEXTS = ["手机号登录", "手机登录", "短信登录", "验证码登录"]
+SEND_CODE_TEXTS = ["获取验证码", "发送验证码", "获取短信验证码", "发送短信验证码"]
+SUBMIT_LOGIN_TEXTS = ["登录", "立即登录", "确认登录", "提交", "下一步", "验证并登录"]
+
+
+def maybe_switch_login_mode(page, login_type: str) -> None:
+    targets = iter_login_targets(page)
+    if login_type == "phone_code":
+        click_first_text(targets, PHONE_TAB_TEXTS)
+        return
+    click_first_text(targets, PASSWORD_TAB_TEXTS)
+
+
+def wait_for_page_settle(page, timeout_ms: int = 2500) -> None:
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception:
+        time.sleep(1)
+
+
+def infer_runtime_auth_requirement(page) -> tuple[bool, str]:
+    needs_auth, reason_code = detect_auth_or_challenge(page)
+    if needs_auth:
+        return True, reason_code
+
+    page_text = ""
+    try:
+        page_text = page.locator("body").inner_text(timeout=1500) or ""
+    except Exception:
+        page_text = ""
+
+    extracted_data = extract_metrics(page)
+    post_issue = infer_post_extraction_issue(
+        page_url=page.url,
+        page_text=page_text,
+        has_login_form=find_first_visible(iter_login_targets(page), USERNAME_SELECTORS + PASSWORD_SELECTORS + CODE_SELECTORS) is not None,
+        extracted_data=extracted_data,
+    )
+    if post_issue in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+        return True, post_issue
+    return False, ErrorCode.NONE
+
+
+def resolve_auth_completion(page, state_json: str) -> tuple[bool, str, str | None]:
+    needs_auth, reason_code = infer_runtime_auth_requirement(page)
+    if needs_auth:
+        return False, reason_code, None
+    if not has_usable_storage_state(state_json):
+        return False, ErrorCode.AUTH_REQUIRED, "本次任务尚未获得服务器端 WEIQ 登录态。本机 Chrome 登录不会同步到服务器。"
+    return True, ErrorCode.NONE, None
+
+
+def _block_task_for_login(task_id: str, session_id: str, reason_code: str, message: str | None = None) -> None:
+    if not task_id:
+        return
+    upsert_task_event(
+        task_id,
+        {
+            "login_session_id": session_id,
+            "status": TaskStatus.BLOCKED_AUTH,
+            "blocked_reason": reason_code,
+            "message": message or "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息",
+        },
+    )
+
+
+def _resume_task_if_authenticated(task_id: str, session_id: str) -> None:
+    if not task_id:
+        return
+    task_row = fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
+    if task_row is None:
+        return
+    current_status = str(task_row.get("status") or TaskStatus.PENDING)
+    if current_status not in {TaskStatus.BLOCKED_AUTH, TaskStatus.PENDING, TaskStatus.RUNNING}:
+        return
+    upsert_task_event(
+        task_id,
+        {
+            "login_session_id": session_id,
+            "status": TaskStatus.PENDING,
+            "blocked_reason": None,
+            "message": "已获取本次任务临时登录态，抓取将继续",
+            "cancel_requested": 0,
+        },
+    )
+    enqueue_task(task_id)
+
+
+def ensure_auth_session_runtime(session_id: str) -> dict[str, Any]:
+    row = fetch_auth_session(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(row):
+        row = expire_auth_session(session_id)
+        return row
+    with ACTIVE_AUTH_LOCK:
+        session = ACTIVE_AUTH_SESSIONS.get(session_id)
+    if session is not None:
+        return row
+
+    state_storage = str(row.get("state_storage") or build_auth_session_paths(session_id)["state_storage"]).strip()
+    login_url = str(row.get("login_url") or "https://www.weiq.com/").strip() or "https://www.weiq.com/"
+    task_id = str(row.get("task_id") or "").strip()
+    task = fetch_one("SELECT headless FROM tasks WHERE task_id = ?", (task_id,)) if task_id else None
+    headless = bool(task.get("headless")) if task else True
+    playwright_ctx = sync_playwright().start()
+    browser, context, page = init_browser(playwright_ctx, state_storage, headless)
+    try:
+        page.goto(login_url, timeout=45000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+    upsert_auth_session(
+        session_id,
+        {
+            "task_id": task_id or row.get("task_id"),
+            "login_url": page.url or login_url,
+            "state_storage": state_storage,
+            "preview_image_path": preview_image_path,
+            "qr_image_base64": preview_base64,
+            "message": row.get("message") or "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+            "expires_at": row.get("expires_at") or expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    write_auth_session_meta(
+        session_id,
+        {
+            "session_id": session_id,
+            "task_id": task_id or None,
+            "state_storage": state_storage,
+            "login_url": page.url or login_url,
+        },
+    )
+    register_active_session(
+        session_id,
+        task_id=task_id,
+        page=page,
+        context=context,
+        state_storage=state_storage,
+        login_url=page.url or login_url,
+        browser=browser,
+        playwright=playwright_ctx,
+    )
+    refreshed = fetch_auth_session(session_id)
+    assert refreshed is not None
+    return refreshed
+
+
+def sanitize_account_text(value: str | None) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def submit_auth_session_inputs(session_id: str, payload: AuthSubmitRequest) -> dict[str, Any]:
+    session_row = fetch_auth_session(session_id)
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(session_row):
+        session_row = expire_auth_session(session_id)
+
+    if session_row.get("status") == "expired":
+        raise HTTPException(status_code=409, detail="本次临时登录会话已过期，请重新创建")
+
+    ensure_auth_session_runtime(session_id)
+    with ACTIVE_AUTH_LOCK:
+        session = ACTIVE_AUTH_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=409, detail="当前登录会话还未进入可操作状态，请等待抓取任务进入登录页后重试")
+
+    page = session["page"]
+    context = session["context"]
+    state_storage = session["state_storage"]
+    task_id = str(session["task_id"])
+    login_type = (payload.login_type or "password").strip().lower()
+    action = (payload.action or "submit").strip().lower()
+
+    with session["lock"]:
+        maybe_switch_login_mode(page, login_type)
+        targets = iter_login_targets(page)
+
+        if login_type == "phone_code":
+            phone = sanitize_account_text(payload.phone or payload.username)
+            if not phone:
+                raise HTTPException(status_code=400, detail="手机号不能为空")
+            if not fill_first_visible(targets, USERNAME_SELECTORS, phone):
+                raise HTTPException(status_code=422, detail="当前 WEIQ 登录页未切换到手机号验证码模式，请改用账号密码登录，或先切换到手机验证码登录后重试")
+            if action == "send_code":
+                preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+                if not click_first_text(targets, SEND_CODE_TEXTS):
+                    raise HTTPException(status_code=422, detail="未找到发送验证码按钮，请检查当前 WEIQ 登录页")
+                time.sleep(1)
+                row = {
+                    "status": "waiting_code",
+                    "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
+                    "preview_image_path": preview_image_path,
+                    "qr_image_base64": preview_base64,
+                    "message": "验证码已尝试发送，请输入收到的短信验证码后继续。",
+                    "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+                }
+                upsert_auth_session(session_id, row)
+                return fetch_auth_session(session_id) or row
+
+            verification_code = sanitize_account_text(payload.verification_code)
+            if not verification_code:
+                raise HTTPException(status_code=400, detail="验证码不能为空")
+            if not fill_first_visible(targets, CODE_SELECTORS, verification_code):
+                raise HTTPException(status_code=422, detail="未找到验证码输入框，请检查当前 WEIQ 登录页")
+        else:
+            username = sanitize_account_text(payload.username or payload.phone)
+            password = str(payload.password or "").strip()
+            if not username or not password:
+                raise HTTPException(status_code=400, detail="账号和密码不能为空")
+            if not fill_first_visible(targets, USERNAME_SELECTORS, username):
+                raise HTTPException(status_code=422, detail="未找到账号输入框，请检查当前 WEIQ 登录页")
+            if not fill_first_visible(targets, PASSWORD_SELECTORS, password):
+                raise HTTPException(status_code=422, detail="未找到密码输入框，请检查当前 WEIQ 登录页")
+
+        preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+        upsert_auth_session(
+            session_id,
+            {
+                "status": "logging_in",
+                "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
+                "preview_image_path": preview_image_path,
+                "qr_image_base64": preview_base64,
+                "message": "已提交登录信息，正在等待 WEIQ 返回结果。",
+                "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+            },
+        )
+
+        if not click_first_text(targets, SUBMIT_LOGIN_TEXTS):
+            raise HTTPException(status_code=422, detail="未找到登录提交按钮，请检查当前 WEIQ 登录页")
+        wait_for_page_settle(page)
+
+        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_storage)
+        if is_authenticated:
+            try:
+                context.storage_state(path=state_storage)
+            except Exception:
+                pass
+            upsert_auth_session(
+                session_id,
+                {
+                    "status": "authenticated",
+                    "login_url": page.url,
+                    "preview_image_path": None,
+                    "qr_image_base64": None,
+                    "message": "本次抓取临时 WEIQ 登录成功",
+                    "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
+                },
+            )
+            unregister_active_session(session_id)
+            _resume_task_if_authenticated(task_id, session_id)
+            row = fetch_auth_session(session_id)
+            assert row is not None
+            return row
+
+    status_text, message = infer_auth_session_state(page, reason_code)
+    preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+    row = {
+        "status": status_text,
+        "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
+        "preview_image_path": preview_image_path,
+        "qr_image_base64": preview_base64,
+        "message": pending_message or message,
+        "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+    }
+    upsert_auth_session(session_id, row)
+    _block_task_for_login(task_id, session_id, reason_code, pending_message or message)
+    return fetch_auth_session(session_id) or row
+
+
+def register_active_session(
+    session_id: str,
+    *,
+    task_id: str,
+    page,
+    context,
+    state_storage: str,
+    login_url: str,
+    browser=None,
+    playwright=None,
+) -> None:
+    with ACTIVE_AUTH_LOCK:
+        previous = ACTIVE_AUTH_SESSIONS.get(session_id)
+        ACTIVE_AUTH_SESSIONS[session_id] = {
+            "task_id": task_id,
+            "page": page,
+            "context": context,
+            "state_storage": state_storage,
+            "login_url": login_url,
+            "browser": browser,
+            "playwright": playwright,
+            "lock": threading.RLock(),
+        }
+        if task_id:
+            TASK_TO_SESSION[task_id] = session_id
+    if previous is not None and previous.get("page") is not page:
+        _close_active_session_runtime(previous)
+
+
+def unregister_active_session(session_id: str) -> None:
+    with ACTIVE_AUTH_LOCK:
+        session = ACTIVE_AUTH_SESSIONS.pop(session_id, None)
+        if session:
+            TASK_TO_SESSION.pop(str(session.get("task_id") or ""), None)
+    _close_active_session_runtime(session)
+
+
+def migrate_active_session(old_session_id: str, new_session_id: str, task_id: str) -> None:
+    if old_session_id == new_session_id:
+        return
+    with ACTIVE_AUTH_LOCK:
+        session = ACTIVE_AUTH_SESSIONS.pop(old_session_id, None)
+        if session is None:
+            return
+        ACTIVE_AUTH_SESSIONS[new_session_id] = session
+        TASK_TO_SESSION[task_id] = new_session_id
+
+
+def ensure_auth_session_for_task(task_id: str, reason_code: str, page_url: str, page, context, state_json: str) -> str:
+    row = fetch_one("SELECT login_session_id FROM tasks WHERE task_id = ?", (task_id,))
+    session_id = str(row.get("login_session_id") or "").strip() if row else ""
+    if not session_id:
+        session_id = uuid4().hex
+        upsert_task_event(task_id, {"login_session_id": session_id})
+    paths = build_auth_session_paths(session_id)
+    status_text, message = infer_auth_session_state(page, reason_code)
+    preview_image_path, qr_image_base64 = capture_login_preview(session_id, page)
+    upsert_auth_session(
+        session_id,
+        {
+            "task_id": task_id,
+            "status": status_text,
+            "login_url": page_url or "https://www.weiq.com/",
+            "state_storage": paths["state_storage"],
+            "preview_image_path": preview_image_path,
+            "qr_image_base64": qr_image_base64,
+            "message": message or "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息",
+            "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    unregister_active_session(session_id)
+    write_auth_session_meta(
+        session_id,
+        {
+            "session_id": session_id,
+            "task_id": task_id,
+            "state_storage": paths["state_storage"],
+            "source_page_url": page_url or "https://www.weiq.com/",
+            "captured_from_runtime": True,
+        },
+    )
+    return session_id
+
+
+def inspect_active_auth_session(session_id: str) -> Optional[dict[str, Any]]:
+    with ACTIVE_AUTH_LOCK:
+        session = ACTIVE_AUTH_SESSIONS.get(session_id)
+    if not session:
+        return None
+    page = session["page"]
+    context = session["context"]
+    state_storage = session["state_storage"]
+    with session["lock"]:
+        is_authenticated, reason_code, pending_message = resolve_auth_completion(page, state_storage)
+        if is_authenticated:
+            try:
+                context.storage_state(path=state_storage)
+            except Exception:
+                pass
+            upsert_auth_session(
+                session_id,
+                {
+                    "status": "authenticated",
+                    "login_url": page.url,
+                    "preview_image_path": None,
+                    "qr_image_base64": None,
+                    "message": "本次抓取临时 WEIQ 登录成功",
+                    "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
+                },
+            )
+            unregister_active_session(session_id)
+            _resume_task_if_authenticated(str(session["task_id"]), session_id)
+        else:
+            status_text, message = infer_auth_session_state(page, reason_code)
+            preview_image_path, preview_base64 = capture_login_preview(session_id, page)
+            upsert_auth_session(
+                session_id,
+                {
+                    "status": status_text,
+                    "login_url": page.url or session.get("login_url") or "https://www.weiq.com/",
+                    "preview_image_path": preview_image_path,
+                    "qr_image_base64": preview_base64,
+                    "message": pending_message or message,
+                    "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+                },
+            )
+    return fetch_auth_session(session_id)
+
+
+def build_hooks(task_id: str) -> CrawlHooks:
+    def on_event(event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type == "task_status":
+            status = event.get("status", TaskStatus.RUNNING)
+            updates = {
+                "status": status,
+                "error_code": event.get("error_code", ErrorCode.NONE),
+                "run_id": event.get("run_id"),
+            }
+            if status == TaskStatus.RUNNING and event.get("started_at"):
+                updates["started_at"] = event["started_at"]
+                updates["message"] = "任务运行中"
+            if status in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                updates["finished_at"] = event.get("finished_at", now_iso())
+            upsert_task_event(task_id, updates)
+
+        elif event_type == "progress":
+            upsert_task_event(
+                task_id,
+                {
+                    "status": TaskStatus.RUNNING,
+                    "progress": event.get("progress", 0.0),
+                    "current_account": event.get("current_account"),
+                    "processed_accounts": event.get("processed", 0),
+                    "total_accounts": event.get("total", 0),
+                    "error_code": event.get("error_code", ErrorCode.NONE),
+                    "message": "任务运行中",
+                },
+            )
+
+        elif event_type == "auth_required":
+            _set_task_blocked_auth(
+                task_id,
+                reason_code=str(event.get("reason_code") or ErrorCode.AUTH_REQUIRED),
+                message=_blocked_auth_message(str(event.get("reason_code") or ErrorCode.AUTH_REQUIRED)),
+            )
+
+    def should_stop() -> bool:
+        return is_cancel_requested(task_id)
+
+    def on_auth_required(reason_code: str, page_url: str, page, context, state_json: str) -> bool:
+        if get_auth_mode() != "browser_worker":
+            session_id = ensure_auth_session_for_task(task_id, reason_code, page_url, page, context, state_json)
+            _block_task_for_login(task_id, session_id, reason_code, f"等待处理登录风控: {page_url}")
+        _set_task_blocked_auth(task_id, reason_code=reason_code, page=page, context=context)
+        return False
+
+    return CrawlHooks(on_event=on_event, should_stop=should_stop, on_auth_required=on_auth_required)
+
+
+def run_task(task_id: str) -> None:
+    row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        return
+    if row["status"] in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        return
+
+    if row["cancel_requested"]:
+        upsert_task_event(
+            task_id,
+            {
+                "status": TaskStatus.CANCELLED,
+                "finished_at": now_iso(),
+                "error_code": ErrorCode.CANCELLED,
+                "message": "任务在启动前已取消",
+            },
+        )
+        finalize_task_auth_session(task_id, TaskStatus.CANCELLED)
+        return
+
+    if get_auth_mode() == "browser_worker":
+        session_id = ""
+        auth_state_storage = str(get_legacy_state_json_path())
+        if not has_usable_storage_state(auth_state_storage):
+            _set_task_blocked_auth(
+                task_id,
+                reason_code=ErrorCode.AUTH_REQUIRED,
+                message="Browser Worker 登录态无效，请先打开远端浏览器并完成 WEIQ 安全验证后继续。",
+            )
+            return
+        display = None
+        if not bool(row["headless"]):
+            try:
+                display = ensure_browser_display()
+            except RuntimeError as exc:
+                upsert_task_event(
+                    task_id,
+                    {
+                        "status": TaskStatus.FAILED,
+                        "finished_at": now_iso(),
+                        "error_code": "DISPLAY_UNAVAILABLE",
+                        "message": str(exc) or BROWSER_DISPLAY_UNAVAILABLE_MESSAGE,
+                    },
+                )
+                return
+    else:
+        session_id = str(row.get("login_session_id") or "").strip()
+        auth_session = fetch_auth_session(session_id) if session_id else None
+        display = None
+        if not session_id:
+            created = create_auth_session(AuthSessionCreateRequest(task_id=task_id, eager=True))
+            session_id = created.session_id
+            auth_session = fetch_auth_session(session_id)
+            row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,)) or row
+        elif auth_session and is_auth_session_expired(auth_session):
+            auth_session = expire_auth_session(session_id)
+
+        auth_state_storage = str(auth_session.get("state_storage") or "").strip() if auth_session else ""
+        auth_status = str(auth_session.get("status") or "").strip() if auth_session else ""
+        if auth_status != "authenticated" or not auth_state_storage or not has_usable_storage_state(auth_state_storage):
+            if auth_session is not None:
+                waiting_message = str(auth_session.get("message") or "").strip() or "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息"
+            else:
+                waiting_message = "本次抓取需要登录 WEIQ，请提交本次任务专属登录信息"
+            _block_task_for_login(task_id, session_id, ErrorCode.AUTH_REQUIRED, waiting_message)
+            return
+
+    config = CrawlConfig(
+        input_excel=row["input_excel"],
+        output_excel=row["output_excel"],
+        output_dir=row["output_dir"],
+        state_json=row["state_json"],
+        state_storage=auth_state_storage,
+        headless=bool(row["headless"]),
+        cooldown_every=row["cooldown_every"],
+        cooldown_seconds=row["cooldown_seconds"],
+        retry_times=max(1, row["retry_times"]),
+        retry_backoff_seconds=max(0, row["retry_backoff_seconds"]),
+        resume=bool(row["resume"]),
+        run_id=str(row.get("run_id") or "").strip() or None,
+        display=display,
+    )
+
+    hooks = build_hooks(task_id)
+
+    upsert_task_event(
+        task_id,
+        {
+            "status": TaskStatus.RUNNING,
+            "started_at": now_iso(),
+            "picked_up_at": now_iso(),
+            "message": "WEIQ 执行器已接单，开始抓取",
+            "current_url": None,
+            "page_title": None,
+            "screenshot_path": None,
+            "resolution": None,
+            "can_resume": 0,
+        },
+    )
+
+    try:
+        result: CrawlRunResult = run_crawl(config=config, hooks=hooks)
+        upsert_task_event(
+            task_id,
+            {
+                "status": result.status,
+                "run_id": result.run_id,
+                "progress": 1.0 if result.total_accounts == 0 else result.processed_accounts / result.total_accounts,
+                "processed_accounts": result.processed_accounts,
+                "total_accounts": result.total_accounts,
+                "success_accounts": result.success_accounts,
+                "failed_accounts": result.failed_accounts,
+                "skipped_accounts": result.skipped_accounts,
+                "output_excel": result.output_excel,
+                "error_code": result.error_code,
+                "finished_at": result.finished_at,
+                "message": (
+                    "任务已完成"
+                    if result.status == TaskStatus.SUCCESS
+                    else "任务执行失败"
+                    if result.status == TaskStatus.FAILED
+                    else _blocked_auth_message(result.error_code)
+                ),
+                "resolution": "open_browser_session" if result.status == TaskStatus.BLOCKED_AUTH and get_auth_mode() == "browser_worker" else None,
+                "can_resume": 1 if result.status == TaskStatus.BLOCKED_AUTH else 0,
+            },
+        )
+        if result.status in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            finalize_task_auth_session(task_id, result.status)
+    except Exception as exc:
+        upsert_task_event(
+            task_id,
+            {
+                "status": TaskStatus.FAILED,
+                "finished_at": now_iso(),
+                "error_code": "RUNTIME_CRASH",
+                "message": f"任务异常崩溃: {exc}",
+            },
+        )
+        finalize_task_auth_session(task_id, TaskStatus.FAILED)
+
+
+async def _resume_browser_worker_task_after_auth(task_id: str) -> dict[str, Any]:
+    return await BROWSER_WORKER_CONTROLLER.resume_task_after_auth(task_id)
+
+
+def _resume_per_task_after_auth(task_id: str, row: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(row.get("login_session_id") or "").strip()
+    if not session_id:
+        return {
+            "task_id": task_id,
+            "status": "TASK_NOT_RESUMABLE",
+            "message": "当前任务没有可恢复的登录会话，请重新发起抓取任务。",
+        }
+    session_row = fetch_auth_session(session_id)
+    if session_row is None:
+        return {
+            "task_id": task_id,
+            "status": "TASK_NOT_RESUMABLE",
+            "message": "当前任务登录会话已失效，请重新发起抓取任务。",
+        }
+    if str(session_row.get("status") or "").strip() != "authenticated":
+        upsert_task_event(
+            task_id,
+            {
+                "status": TaskStatus.BLOCKED_AUTH,
+                "blocked_reason": ErrorCode.AUTH_REQUIRED,
+                "error_code": "BLOCKED_AUTH",
+                "message": str(session_row.get("message") or "").strip() or "WEIQ 验证尚未完成，请先完成验证后再继续抓取。",
+                "resolution": "submit_login_session",
+                "can_resume": 1,
+            },
+        )
+        latest = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+        return build_status_payload(latest or row)
+
+    _clear_blocked_auth_context(task_id)
+    upsert_task_event(
+        task_id,
+        {
+            "status": TaskStatus.PENDING,
+            "blocked_reason": None,
+            "error_code": ErrorCode.NONE,
+            "message": "已完成 WEIQ 安全验证，任务已重新入队继续执行。",
+            "current_url": None,
+            "page_title": None,
+            "screenshot_path": None,
+            "resolution": None,
+            "can_resume": 0,
+            "finished_at": None,
+            "resume_requested": 1,
+            "cancel_requested": 0,
+        },
+    )
+    enqueue_task(task_id)
+    latest = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+    return build_status_payload(latest or {"task_id": task_id, "status": TaskStatus.PENDING, "message": "任务已重新入队"})
+
+
+def worker_loop() -> None:
+    global LAST_WORKER_ERROR
+    while True:
+        task_id = TASK_QUEUE.get()
+        with QUEUE_LOCK:
+            QUEUED_TASK_IDS.discard(task_id)
+            ACTIVE_TASK_IDS.add(task_id)
+        threading.Thread(
+            target=_run_task_in_background,
+            args=(task_id,),
+            daemon=True,
+            name=f"weiq-task-{task_id[:8]}",
+        ).start()
+        TASK_QUEUE.task_done()
+
+
+def _run_task_in_background(task_id: str) -> None:
+    global LAST_WORKER_ERROR
+    try:
+        run_task(task_id)
+        LAST_WORKER_ERROR = None
+    except Exception as exc:
+        LAST_WORKER_ERROR = f"{now_iso()} {exc}"
+        upsert_task_event(
+            task_id,
+            {
+                "status": TaskStatus.FAILED,
+                "finished_at": now_iso(),
+                "error_code": "INTERNAL_ERROR",
+                "message": f"Worker 异常退出: {exc}",
+            },
+        )
+    finally:
+        with QUEUE_LOCK:
+            ACTIVE_TASK_IDS.discard(task_id)
+
+
+def start_worker() -> None:
+    global WORKER_THREAD, WORKER_STARTED_AT
+    if WORKER_THREAD is not None and WORKER_THREAD.is_alive():
+        return
+    thread = threading.Thread(target=worker_loop, daemon=True, name="weiq-task-worker")
+    thread.start()
+    WORKER_THREAD = thread
+    WORKER_STARTED_AT = now_iso()
+
+
+def recover_incomplete_tasks() -> None:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, status FROM tasks WHERE status IN (?, ?)",
+                (TaskStatus.PENDING, TaskStatus.RUNNING),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    for row in rows:
+        task_id = str(row["task_id"])
+        status = str(row["status"])
+        if status == TaskStatus.RUNNING:
+            upsert_task_event(
+                task_id,
+                {
+                    "status": TaskStatus.PENDING,
+                    "message": "服务重启后重新入队",
+                    "progress": 0.0,
+                },
+            )
+        else:
+            upsert_task_event(task_id, {"message": "服务重启后重新入队"})
+        enqueue_task(task_id)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "time": now_iso()}
+
+
+@app.get("/v1/debug/env")
+async def debug_env() -> dict[str, Any]:
+    browser_payload = await BROWSER_WORKER_CONTROLLER.status() if get_auth_mode() == "browser_worker" else {}
+    return {
+        "auth_mode": get_auth_mode(),
+        "legacy_state_json": str(get_legacy_state_json_path()),
+        "browser_user_data_dir": str(get_browser_user_data_dir()),
+        "browser_headless": get_browser_headless(),
+        "browser_display": browser_payload.get("browser_display"),
+        "display_ready": browser_payload.get("display_ready", False),
+        "xvfb_running": browser_payload.get("xvfb_running", False),
+        "x11vnc_running": browser_payload.get("x11vnc_running", False),
+        "websockify_running": browser_payload.get("websockify_running", False),
+        "browser_worker_headless": get_browser_headless(),
+        "crawl_will_use_display": browser_payload.get("crawl_will_use_display", False),
+        "db_path": str(DB_PATH),
+        "runtime_dir": str(get_runtime_dir()),
+        "auth_state_dir": str(get_auth_state_dir()),
+    }
+
+
+@app.get("/v1/worker/health", response_model=WorkerHealthResponse)
+def worker_health() -> WorkerHealthResponse:
+    pending_count = fetch_value("SELECT COUNT(1) FROM tasks WHERE status = ?", (TaskStatus.PENDING,))
+    running_count = fetch_value("SELECT COUNT(1) FROM tasks WHERE status = ?", (TaskStatus.RUNNING,))
+    with QUEUE_LOCK:
+        queued_ids = sorted(QUEUED_TASK_IDS)
+    return WorkerHealthResponse(
+        worker_alive=bool(WORKER_THREAD and WORKER_THREAD.is_alive()),
+        worker_started_at=WORKER_STARTED_AT,
+        queue_size=TASK_QUEUE.qsize(),
+        queued_task_ids=queued_ids,
+        pending_count=pending_count,
+        running_count=running_count,
+        last_worker_error=LAST_WORKER_ERROR,
+        process_id=os.getpid(),
+        db_path=str(DB_PATH),
+    )
+
+
+@app.get("/v1/auth/browser/status", response_model=BrowserAuthStatusResponse)
+async def get_browser_auth_status() -> BrowserAuthStatusResponse:
+    return BrowserAuthStatusResponse(**(await BROWSER_WORKER_CONTROLLER.status()))
+
+
+@app.post("/v1/auth/browser/open", response_model=BrowserAuthStatusResponse)
+async def open_browser_auth() -> BrowserAuthStatusResponse:
+    if get_auth_mode() != "browser_worker":
+        raise HTTPException(status_code=409, detail="当前服务未启用 browser_worker 模式")
+    try:
+        payload = await BROWSER_WORKER_CONTROLLER.open()
+    except BrowserWorkerStartupError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "BROWSER_WORKER_START_FAILED",
+                "stage": exc.stage,
+                "message": str(exc),
+            },
+        ) from exc
+    return BrowserAuthStatusResponse(**payload)
+
+
+@app.post("/v1/auth/browser/check", response_model=BrowserAuthStatusResponse)
+async def check_browser_auth() -> BrowserAuthStatusResponse:
+    if get_auth_mode() != "browser_worker":
+        raise HTTPException(status_code=409, detail="当前服务未启用 browser_worker 模式")
+    return BrowserAuthStatusResponse(**(await BROWSER_WORKER_CONTROLLER.check()))
+
+
+@app.post("/v1/auth/browser/close", response_model=BrowserAuthStatusResponse)
+async def close_browser_auth() -> BrowserAuthStatusResponse:
+    if get_auth_mode() != "browser_worker":
+        raise HTTPException(status_code=409, detail="当前服务未启用 browser_worker 模式")
+    return BrowserAuthStatusResponse(**(await BROWSER_WORKER_CONTROLLER.close()))
+
+
+@app.post("/v1/tasks/crawl", response_model=TaskControlResponse)
+def create_task(payload: CreateTaskRequest) -> TaskControlResponse:
+    if get_auth_mode() == "browser_worker":
+        auth_payload = _browser_worker_status_payload()
+        if not auth_payload["authenticated"]:
+            return TaskControlResponse(task_id=None, status="AUTH_REQUIRED", message=auth_payload["message"] or "需要先登录 WEIQ")
+    task_id = uuid4().hex
+    created_at = now_iso()
+    materialized = materialize_task_request(payload)
+    if get_auth_mode() == "browser_worker":
+        materialized["state_storage"] = str(get_legacy_state_json_path())
+        materialized["headless"] = get_browser_headless()
+
+    execute(
+        """
+        INSERT INTO tasks (
+            task_id, status, progress, current_account, blocked_reason, error_code, message,
+            input_excel, output_excel, output_dir, state_json, state_storage,
+            headless, cooldown_every, cooldown_seconds, retry_times, retry_backoff_seconds, resume,
+            login_session_id, accepted_at, picked_up_at, created_at
+        ) VALUES (?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+        """,
+        (
+            task_id,
+            TaskStatus.PENDING,
+            ErrorCode.NONE,
+            "任务已受理，等待执行器接单",
+            materialized["input_excel"],
+            materialized["output_excel"],
+            materialized["output_dir"],
+            materialized["state_json"],
+            materialized["state_storage"],
+            int(bool(materialized["headless"])),
+            materialized["cooldown_every"],
+            materialized["cooldown_seconds"],
+            materialized["retry_times"],
+            materialized["retry_backoff_seconds"],
+            int(bool(materialized["resume"])),
+            created_at,
+            created_at,
+        ),
+    )
+
+    enqueue_task(task_id)
+    return TaskControlResponse(task_id=task_id, status=TaskStatus.PENDING, message="任务已受理")
 
 
 @app.get("/v1/tasks/{task_id}")
-def get_task_status(task_id: str) -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        task = _get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="task not found")
-    return _task_response(task)
+def get_task(task_id: str) -> dict[str, Any]:
+    row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return build_status_payload(row)
+
+
+@app.post("/v1/tasks/{task_id}/resume-after-auth")
+async def resume_task_after_auth(task_id: str) -> dict[str, Any]:
+    row = fetch_one("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] != TaskStatus.BLOCKED_AUTH:
+        return {
+            "task_id": task_id,
+            "status": "TASK_NOT_RESUMABLE",
+            "message": "当前任务不在等待人工验证状态，请重新发起抓取任务。",
+        }
+    if get_auth_mode() == "browser_worker":
+        return await _resume_browser_worker_task_after_auth(task_id)
+    return _resume_per_task_after_auth(task_id, row)
+
+
+@app.post("/v1/tasks/{task_id}/cancel", response_model=TaskControlResponse)
+def cancel_task(task_id: str) -> TaskControlResponse:
+    row = fetch_one("SELECT status, login_session_id FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if row["status"] in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        return TaskControlResponse(task_id=task_id, status=row["status"], message="任务已是终态")
+
+    upsert_task_event(task_id, {"cancel_requested": 1, "message": "已请求取消任务"})
+    if row.get("login_session_id"):
+        mark_auth_session_cleaned(str(row["login_session_id"]), status="expired", message="本次临时登录态已清理")
+    return TaskControlResponse(task_id=task_id, status=TaskStatus.CANCELLED, message="取消请求已发送")
+
+
+@app.post("/v1/tasks/{task_id}/resume", response_model=TaskControlResponse)
+def resume_task(task_id: str) -> TaskControlResponse:
+    row = fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if row["status"] != TaskStatus.BLOCKED_AUTH:
+        return TaskControlResponse(task_id=task_id, status=row["status"], message="当前任务不在等待登录状态")
+
+    upsert_task_event(task_id, {"resume_requested": 1, "message": "已请求继续任务"})
+    return TaskControlResponse(task_id=task_id, status=TaskStatus.RUNNING, message="继续请求已发送")
+
+
+@app.get("/v1/tasks/{task_id}/blocked-screenshot")
+def download_task_blocked_screenshot(task_id: str):
+    row = fetch_one("SELECT screenshot_path FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    screenshot_path = str(row.get("screenshot_path") or "").strip()
+    if not screenshot_path:
+        raise HTTPException(status_code=404, detail="当前任务没有可用截图")
+    screenshot_file = Path(screenshot_path).resolve()
+    if not screenshot_file.exists() or not screenshot_file.is_file():
+        raise HTTPException(status_code=404, detail="当前任务截图不存在")
+    return FileResponse(path=str(screenshot_file), media_type="image/png", filename=screenshot_file.name)
+
+
+@app.post("/v1/tasks/{task_id}/requeue", response_model=TaskControlResponse)
+def requeue_task(task_id: str) -> TaskControlResponse:
+    row = fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] == TaskStatus.SUCCESS:
+        raise HTTPException(status_code=409, detail="成功任务不允许重新入队")
+
+    upsert_task_event(
+        task_id,
+        {
+            "status": TaskStatus.PENDING,
+            "progress": 0.0,
+            "cancel_requested": 0,
+            "resume_requested": 0,
+            "blocked_reason": None,
+            "current_account": None,
+            "started_at": None,
+            "finished_at": None,
+            "message": "任务已重新入队",
+        },
+    )
+    enqueue_task(task_id)
+    return TaskControlResponse(task_id=task_id, status=TaskStatus.PENDING, message="任务已重新入队")
+
+
+@app.post("/v1/auth/session", response_model=AuthSessionResponse)
+def create_auth_session(payload: AuthSessionCreateRequest | None = None) -> AuthSessionResponse:
+    payload = payload or AuthSessionCreateRequest()
+    session_id = uuid4().hex
+    headless = True
+    task_id = payload.task_id
+    paths = build_auth_session_paths(session_id)
+    if task_id:
+        task = fetch_one("SELECT task_id, headless FROM tasks WHERE task_id = ?", (task_id,))
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        headless = bool(task.get("headless"))
+    upsert_auth_session(
+        session_id,
+        {
+            "task_id": task_id,
+            "status": "waiting_credentials",
+            "login_url": "https://www.weiq.com/",
+            "state_storage": paths["state_storage"],
+            "preview_image_path": None,
+            "qr_image_base64": None,
+            "message": "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+            "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    write_auth_session_meta(
+        session_id,
+        {
+            "session_id": session_id,
+            "task_id": task_id,
+            "state_storage": paths["state_storage"],
+        },
+    )
+    if task_id:
+        upsert_task_event(task_id, {"login_session_id": session_id})
+    if payload.eager:
+        row = _build_eager_auth_session_state(
+            session_id=session_id,
+            task_id=task_id,
+            state_storage=paths["state_storage"],
+            headless=headless,
+        )
+        return build_auth_session_response(row)
+    row = fetch_auth_session(session_id)
+    assert row is not None
+    return build_auth_session_response(row)
+
+
+@app.get("/v1/auth/session/{session_id}", response_model=AuthSessionResponse)
+def get_auth_session(session_id: str) -> AuthSessionResponse:
+    row = inspect_active_auth_session(session_id) or fetch_auth_session(session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(row):
+        row = expire_auth_session(session_id)
+    return build_auth_session_response(row)
+
+
+@app.post("/v1/auth/session/{session_id}/attach-task", response_model=AuthSessionResponse)
+def attach_auth_session_to_task(session_id: str, payload: AuthAttachTaskRequest) -> AuthSessionResponse:
+    task = fetch_one("SELECT task_id, login_session_id, status, headless FROM tasks WHERE task_id = ?", (payload.task_id,))
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    existing = fetch_auth_session(session_id)
+    if existing is None:
+        paths = build_auth_session_paths(session_id)
+        upsert_auth_session(
+            session_id,
+            {
+                "task_id": payload.task_id,
+                "status": "waiting_credentials",
+                "login_url": "https://www.weiq.com/",
+                "state_storage": paths["state_storage"],
+                "qr_image_base64": None,
+                "message": "本机 WEIQ 页面只用于参考。服务器抓取环境需要通过本次远端登录会话完成登录。",
+                "expires_at": expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+            },
+        )
+
+    upsert_task_event(payload.task_id, {"login_session_id": session_id})
+    upsert_auth_session(session_id, {"task_id": payload.task_id, "message": "本次登录会话已绑定当前抓取任务"})
+    if session_id not in ACTIVE_AUTH_SESSIONS:
+        session_row = fetch_auth_session(session_id)
+        if session_row and str(session_row.get("status") or "") in AUTH_WAITING_STATUSES:
+            _build_eager_auth_session_state(
+                session_id=session_id,
+                task_id=payload.task_id,
+                state_storage=str(session_row.get("state_storage") or build_auth_session_paths(session_id)["state_storage"]),
+                headless=bool(task.get("headless")),
+            )
+    return get_auth_session(session_id)
+
+
+@app.post("/v1/auth/session/{session_id}/submit", response_model=AuthSessionResponse)
+def submit_auth_session(session_id: str, payload: AuthSubmitRequest) -> AuthSessionResponse:
+    row = submit_auth_session_inputs(session_id, payload)
+    return build_auth_session_response(row)
+
+
+@app.post("/v1/auth/session/{session_id}/check", response_model=AuthSessionResponse)
+def check_auth_session(session_id: str) -> AuthSessionResponse:
+    row = inspect_active_auth_session(session_id) or fetch_auth_session(session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="登录会话不存在")
+    if is_auth_session_expired(row):
+        row = expire_auth_session(session_id)
+        return build_auth_session_response(row)
+
+    state_storage = str(row.get("state_storage") or "").strip()
+    if state_storage and has_usable_storage_state(state_storage):
+        upsert_auth_session(
+            session_id,
+            {
+                "status": "authenticated",
+                "message": "本次抓取临时 WEIQ 登录成功",
+                "preview_image_path": None,
+                "qr_image_base64": None,
+                "expires_at": expiry_iso(max(30, get_auth_session_ttl_seconds() // 60)),
+            },
+        )
+        row = fetch_auth_session(session_id) or row
+        _resume_task_if_authenticated(str(row.get("task_id") or ""), session_id)
+        return build_auth_session_response(row)
+
+    waiting_message = "本次任务尚未获得服务器端 WEIQ 登录态。本机 Chrome 登录不会同步到服务器。"
+    upsert_auth_session(
+        session_id,
+        {
+            "status": "waiting_credentials",
+            "message": waiting_message,
+            "expires_at": row.get("expires_at") or expiry_iso(max(1, get_auth_session_ttl_seconds() // 60)),
+        },
+    )
+    row = fetch_auth_session(session_id) or row
+    return build_auth_session_response(row)
+
+
+@app.get("/v1/tasks/{task_id}/latest")
+def get_task_latest(task_id: str, limit: int = 20) -> dict[str, Any]:
+    row = fetch_one("SELECT output_excel, run_id FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    output_excel = row.get("output_excel")
+    run_id = row.get("run_id")
+    if not output_excel or not Path(output_excel).exists():
+        return {"task_id": task_id, "records": [], "count": 0}
+
+    df = pd.read_excel(output_excel)
+    if run_id and "run_id" in df.columns:
+        df = df[df["run_id"] == run_id]
+
+    if df.empty:
+        return {"task_id": task_id, "records": [], "count": 0}
+
+    df = df.tail(max(1, min(200, limit)))
+    return {
+        "task_id": task_id,
+        "run_id": run_id,
+        "count": len(df),
+        "records": df.to_dict(orient="records"),
+    }
+
+
+@app.get("/v1/accounts/{uid}/changes")
+def get_account_changes(uid: str, output_excel: str = "weiq_results.xlsx", limit: int = 30) -> dict[str, Any]:
+    excel_path = Path(output_excel)
+    if not excel_path.exists():
+        raise HTTPException(status_code=404, detail="结果文件不存在")
+    df = load_result_df(str(excel_path))
+    return incremental_changes(df=df, uid=uid, limit=limit)
+
+
+@app.get("/v1/tasks/{task_id}/quality")
+def get_task_quality(task_id: str) -> dict[str, Any]:
+    row = fetch_one("SELECT output_excel, run_id FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    output_excel = row.get("output_excel")
+    run_id = row.get("run_id")
+    if not output_excel or not Path(output_excel).exists():
+        raise HTTPException(status_code=404, detail="结果文件不存在")
+    df = load_result_df(output_excel)
+    return quality_report(df=df, run_id=run_id)
 
 
 @app.get("/v1/tasks/{task_id}/export")
-def export_task_excel(task_id: str):
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        task = _get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="task not found")
-    output_excel = task.get("output_excel")
-    if not output_excel or not Path(output_excel).exists():
-        raise HTTPException(status_code=404, detail="export file not found")
-    return FileResponse(output_excel, filename=Path(output_excel).name, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+def export_task_result(task_id: str):
+    row = fetch_one("SELECT status, output_excel, output_dir FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] != TaskStatus.SUCCESS:
+        raise HTTPException(status_code=409, detail="任务尚未成功完成，暂不能导出结果")
 
+    output_excel = str(row.get("output_excel") or "").strip()
+    output_dir = str(row.get("output_dir") or "").strip()
+    if not output_excel:
+        raise HTTPException(status_code=404, detail="结果文件不存在")
+    output_path = Path(output_excel)
+    if not output_path.is_absolute():
+        output_path = Path(output_dir or ".") / output_path
+    output_path = output_path.resolve()
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="结果文件不存在")
 
-@app.post("/v1/tasks/{task_id}/cancel")
-def cancel_task(task_id: str) -> dict[str, Any]:
-    runtime = get_runtime_manager()
-    with db_conn(runtime.settings) as conn:
-        task = _get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="task not found")
-        if task["status"] in {TaskStatus.SUCCESS.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
-            return _task_response(task)
-        _update_row(
-            conn,
-            "tasks",
-            "task_id",
-            task_id,
-            status=TaskStatus.CANCELLED.value,
-            error_code=ErrorCode.CANCELLED.value,
-            message="任务已取消",
-            finished_at=_iso_now(),
-        )
-        task = _get_task(conn, task_id)
-    return _task_response(task)
+    return FileResponse(
+        path=str(output_path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=output_path.name,
+    )

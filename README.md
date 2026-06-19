@@ -1,59 +1,194 @@
-# WEIQ Scraper Stable API
+# WEIQ 数据采集与变化追踪平台
 
-`weiq-scraper-stable-api` 是唯一抓取执行器。
+最近更新时间：**2026-04-12 20:58:41 CST (+0800, Asia/Shanghai)**
 
-- `weibo` 负责业务编排、登录引导、预览和导入
-- 本仓库负责登录会话落盘、Playwright 抓取执行、Excel 导出、任务状态查询
-- `weibo` 只通过 HTTP 调用本服务
-- `weibo` 不读取本仓库 SQLite，也不依赖共享目录
+## 1. 项目简介
 
-## 当前结构
+WEIQ 项目用于采集账号数据、记录字段变化，并对网站提供标准 API 接口。项目分为两条使用路径：
+- 桌面端（给运营/非技术同学）：图形化操作，支持账号密码或手机号验证码登录，任务可视化，导出可管理。
+- API 服务（给网站/后端）：任务提交、任务状态查询、账号最新数据与变化记录读取。
 
-- [scraper.py](/Users/youfei/Desktop/weiq-scraper-stable-api/scraper.py)  
-  CLI 包装层，终端模式入口
-- [scraper_runtime.py](/Users/youfei/Desktop/weiq-scraper-stable-api/scraper_runtime.py)  
-  共用抓取 runtime，CLI 和 API 都调用 `run_crawl()`
-- [cloud_api.py](/Users/youfei/Desktop/weiq-scraper-stable-api/cloud_api.py)  
-  FastAPI 服务，负责 auth session、task、worker、export
-- [main.py](/Users/youfei/Desktop/weiq-scraper-stable-api/main.py)  
-  本地结果看板，不参与 API worker 执行
+核心目标：
+- 把“手工采集 + 手工拷表”改成“任务化采集 + 可追溯存储 + 稳定接口输出”。
+- 处理登录失效、任务阻塞、导出管理等高频问题。
 
-## 安装
+## 2. 当前版本能力总览
 
-```bash
-python3 -m venv .venv
-./.venv/bin/python -m pip install --upgrade pip
-./.venv/bin/python -m pip install -e .
-./.venv/bin/python -m playwright install chromium
+- 任务级临时登录态：每个抓取任务单独创建一份远端临时 `storage_state.json`，登录成功后只供当前任务使用。
+- 任务可观测：状态、进度、当前账号、结构化日志、错误码与中文提示可实时查看。
+- 旧库兼容：支持旧 SQLite 结构兼容运行，避免升级后直接报错卡死。
+- 多账号表运行：可选择 `inputs/` 下不同 Excel 作为任务输入源。
+- 导出增强：
+  - 运行前可指定导出目录；
+  - 运行后可把导出文件复制到任意目录；
+  - 历史文件不覆盖。
+- 认证等级识别（结构化优先）：
+  - 新增结果字段 `认证等级`；
+  - 主判定改为读取昵称右侧认证 `svg` 的 `path fill` 组合；
+  - 当前已验真映射：`#FFF/#F6CA45/#FFF -> 黄V`、`#FFF/#FF6C00/#FFF -> 橙V`、`#FEFF78/#CD3620/#FEFF78 -> 金V`；
+  - 明确区分 `无认证` 与 `unknown`，不以截图取色作为主逻辑。
+- 网站接入友好：提供任务与账号数据查询 API，支持轮询集成。
+
+## 3. 目录结构说明
+
+```text
+.
+├── desktop_app.py            # 桌面端 UI（Streamlit）
+├── scraper.py                # 采集主引擎（CLI + 调度）
+├── cloud_api.py              # API 服务（FastAPI）
+├── src/weiq_core/            # 核心契约与通用模块
+├── tests/                    # 单元测试
+├── inputs/                   # 多账号输入表目录（本地使用，不提交仓库）
+├── data/                     # 中间数据目录
+├── weiq_local.db             # 本地 SQLite（本地使用，不提交仓库）
+└── CHANGELOG.md              # 更新日志
 ```
 
-## CLI 用法
+## 4. 快速开始（非技术用户）
 
-终端模式仍可继续使用，并且现在也走同一个 `scraper_runtime.run_crawl()`。
+### 第 1 步：安装依赖
 
 ```bash
-./.venv/bin/python scraper.py \
-  --input-excel ./accounts.xlsx \
-  --output-dir ./output \
-  --state-storage ./state.json
+python -m pip install --upgrade pip
+python -m pip install playwright "psycopg[binary]" apscheduler streamlit plotly openpyxl pandas fastapi uvicorn
+python -m playwright install chromium --no-shell
 ```
 
-可选参数：
+说明：
+- 如果你使用 `zsh`，`psycopg[binary]` 必须加引号。
+- `--no-shell` 可减少浏览器内核下载失败概率。
 
-- `--output-excel` 指定完整输出文件路径
-- `--headless` 使用无头浏览器
-- `--login-url` 指定缺少登录态时打开的登录页
-- `--probe-verify` 运行认证等级探针
-- `--probe-uids` 指定探针 uid 列表
+### 第 2 步：启动桌面端
 
-首次没有 `storage_state` 时，CLI 会打开浏览器等待人工登录，登录成功后保存到 `state.json`。
-
-## API 用法
-
-启动服务：
+- macOS：双击 `start_desktop.command`
+- Windows：双击 `start_desktop.bat`
+- 或命令行：
 
 ```bash
-./.venv/bin/python -m uvicorn cloud_api:app --host 127.0.0.1 --port 8080 --workers 1
+python -m streamlit run desktop_app.py
+```
+
+### 第 3 步：准备账号输入表
+
+在页面中进入“账号表管理”：
+- 没有模板时先生成模板；
+- 填写账号后上传到 `inputs/` 或直接在页面导入。
+
+建议字段：
+- `账号ID`（业务名称）
+- `uid`（唯一标识，必填）
+
+### 第 4 步：配置并启动任务
+
+页面“开始采集”区域按顺序设置：
+1. 选择输入表。
+2. 选择数据库模式（旧库兼容 / 新结构）。
+3. 设置导出目录（可自定义）。
+4. 点击“开始采集任务”。
+
+### 第 5 步：任务运行中如何看状态
+
+你会看到：
+- 状态（中文）
+- 进度条
+- 当前处理账号
+- 最近日志
+- 异常诊断
+
+关键状态说明：
+- `运行中`：正常采集。
+- `等待登录`：登录失效或风控，需要你在浏览器完成登录。
+- `已暂停`：人为暂停。
+- `失败`：任务已终止，查看错误码和日志。
+- `成功`：任务完成，可导出或供 API 读取。
+
+### 第 6 步：登录失效处理（重点）
+
+当页面提示登录失效时：
+1. 浏览器窗口会保持打开（不会自动关闭）。
+2. 你在浏览器里完成登录。
+3. 回到桌面端点击“登录后继续（手动）”。
+4. 系统先校验登录态，通过后恢复任务。
+
+### 第 7 步：导出与归档
+
+任务完成后：
+- 页面显示本次导出文件路径。
+- 可输入任意目标目录，点击“复制导出文件到目标目录”。
+- 原始导出保留，不覆盖历史。
+
+## 5. 技术用户 CLI 教程
+
+### 5.1 直接运行
+
+```bash
+python scraper.py
+```
+
+### 5.2 指定输入表与导出目录
+
+```bash
+python scraper.py \
+  --input-excel /绝对路径/accounts.xlsx \
+  --output-dir /绝对路径/exports
+```
+
+### 5.3 数据库模式
+
+```bash
+# 旧库兼容模式
+python scraper.py --schema-mode legacy
+
+# 完整新结构模式
+python scraper.py --schema-mode full
+```
+
+### 5.4 周任务调度（示例）
+
+```bash
+python scraper.py --weekly --day-of-week mon --hour 3 --minute 0 --run-immediately
+```
+
+### 5.5 认证等级探针（4样本验收）
+
+```bash
+python scraper.py --probe-verify
+```
+
+说明：
+- 默认探针样本：`2115314532,6557986019,5099051423,7331622139`
+- 可自定义：
+
+```bash
+python scraper.py --probe-verify --probe-uids 2115314532,6557986019
+```
+
+探针会输出每个 uid 的：
+- `认证等级`（`黄V` / `橙V` / `金V` / `无认证` / `unknown`）
+- `证据来源`（例如 `dom_svg_exact` / `dom_svg_absent` / `dom_svg_unknown` / `api`）
+- `线索预览`（`svg` 片段、`fill` 组合或接口字段片段）
+
+## 6. API 接入网站详细教程
+
+本节给网站开发同学，按“提交任务 -> 轮询 -> 控制 -> 拉取数据”落地。
+
+### 6.1 启动 API 服务
+
+```bash
+python -m uvicorn cloud_api:app --host 0.0.0.0 --port 8080 --workers 1
+
+说明：
+- 当前云端 API 依赖进程内任务队列，只支持单 worker 进程模式。
+- 默认兼容旧流程的认证模式为 `WEIQ_AUTH_MODE=per_task`。
+- 新的网站一键触发流程推荐改成 `WEIQ_BROWSER_AUTH_MODE=browser_worker`，并配套：
+  - `WEIQ_LEGACY_STATE_JSON=/opt/weiq-scraper-stable-api/state.json`
+  - `WEIQ_BROWSER_USER_DATA_DIR=/opt/weiq-scraper-stable-api/browser_profile`
+  - `WEIQ_BROWSER_HEADLESS=false`
+- 可选环境变量：
+  - `WEIQ_AUTH_SESSION_TTL_SECONDS=600`
+  - `WEIQ_AUTH_STATE_DIR=/opt/weiq-scraper-stable-api/runtime/auth_sessions`
+  - `WEIQ_KEEP_AUTH_STATE_FOR_DEBUG=false`
+- 如果后续需要多 worker/多实例，请改为 Redis、Celery、RQ 等外部队列方案。
 ```
 
 健康检查：
@@ -62,147 +197,212 @@ python3 -m venv .venv
 curl http://127.0.0.1:8080/health
 ```
 
-### 登录会话接口
+### 6.2 提交采集任务
 
-- `POST /v1/auth/session`
-  - 轻量创建 session，只建目录和 DB 记录，不启动浏览器
-- `POST /v1/auth/session/{session_id}/submit`
-  - 真正执行服务器端登录，并在成功后生成 `storage_state.json`
-- `POST /v1/auth/session/{session_id}/check`
-  - 只检查该 session 的 `storage_state`
+接口：`POST /v1/tasks/crawl`
 
-### 抓取任务接口
+如果当前为 `browser_worker` 模式且长期登录态无效，接口会直接返回：
 
-- `POST /v1/tasks/crawl`
-  - 必须带 `login_session_id`
-  - 对应 session 必须已经 `authenticated`
-- `GET /v1/tasks/{task_id}`
-  - 查询任务状态和进度
-- `GET /v1/tasks/{task_id}/export`
-  - 下载本次抓取导出的 Excel
+```json
+{
+  "task_id": null,
+  "status": "AUTH_REQUIRED",
+  "message": "请在 Browser Worker 登录窗口中完成 WEIQ 登录"
+}
+```
+
+请求示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8080/v1/tasks/crawl" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "weiq",
+    "priority": 5,
+    "accounts": [
+      {"account_id": "客户A", "uid": "123456"},
+      {"account_id": "客户B", "uid": "789012"}
+    ]
+  }'
+```
+
+响应示例：
+
+```json
+{
+  "task_id": "e7be...",
+  "status": "PENDING",
+  "status_zh": "排队中",
+  "progress": 0.0,
+  "message": "任务已创建"
+}
+```
+
+### 6.3 轮询任务状态
+
+接口：`GET /v1/tasks/{task_id}`
+
+### 6.2.1 Browser Worker 登录态接口
+
+- `GET /v1/auth/browser/status`
+- `POST /v1/auth/browser/open`
+- `POST /v1/auth/browser/check`
+
+这组接口用于网站在不接收 WEIQ 账号密码的前提下，查询远端浏览器登录态、打开远端可视浏览器登录窗口，并在用户手动登录后检查长期 `state.json` 是否已经可复用。
+
+建议轮询间隔：2~3 秒。
+
+关键字段：
+- `status`：程序判断字段（英文）。
+- `status_zh`：页面展示字段（中文）。
+- `progress`：0~1。
+- `current_account`：当前账号。
+- `blocked_reason`：阻塞原因（如 `AUTH_REQUIRED`）。
+- `error_code`：错误码（英文）。
+- `error_message_zh`：错误中文解释。
+- `auth_waiting`：是否等待登录。
+- `resume_requested`：是否收到继续请求。
+- `auth_check_passed`：继续前登录校验是否通过。
+- `output_dir`：导出目录。
+- `export_file`：导出文件路径。
+
+终态判断：
+- 成功终态：`SUCCESS`
+- 失败终态：`FAILED`
+- 取消终态：`CANCELLED`
+
+### 6.4 控制任务（暂停/继续/取消）
+
+- `POST /v1/tasks/{task_id}/pause`
+- `POST /v1/tasks/{task_id}/resume`
 - `POST /v1/tasks/{task_id}/cancel`
-  - 取消任务
 
-### 诊断接口
+继续接口建议流程：
+1. 用户在浏览器完成登录。
+2. 前端点击“继续”。
+3. 后端调用 `/resume`。
+4. 再轮询 `/tasks/{task_id}`，确认从 `BLOCKED_AUTH` 回到 `RUNNING`。
 
-- `GET /v1/worker/health`
-- `GET /v1/debug/env`
-- `GET /v1/debug/weiq-access`
+### 6.5 拉取采集结果数据
 
-`/v1/debug/env` 只返回安全诊断信息，不返回 cookie、密码、token、`storage_state` 内容。
-`/v1/debug/weiq-access` 会分别用 `httpx` 和 Playwright Chromium 测试 WEIQ 可达性，并返回安全化后的出口信息。
+- `GET /v1/accounts/{uid}/latest`：获取最新快照。
+- `GET /v1/accounts/{uid}/changes`：获取变化记录。
 
-## 运行时目录与环境变量
+典型页面流程：
+1. 先查 `latest` 渲染当前值。
+2. 再查 `changes` 渲染“最近变化历史”。
 
-推荐线上目录：
+### 6.6 网站前端接入示例（JavaScript）
 
-```text
-/opt/weiq-scraper-stable-api
-├── .venv
-├── cloud_api.py
-├── scraper.py
-├── scraper_runtime.py
-├── weiq_local.db
-└── runtime
-    ├── auth_sessions
-    └── tasks
+```js
+async function startAndTrack(payload) {
+  const createRes = await fetch('/api/proxy/v1/tasks/crawl', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const createData = await createRes.json();
+  const taskId = createData.task_id;
+
+  const timer = setInterval(async () => {
+    const res = await fetch(`/api/proxy/v1/tasks/${taskId}`);
+    const task = await res.json();
+
+    renderStatus(task.status_zh || task.status);
+    renderProgress(task.progress || 0);
+    renderCurrent(task.current_account || '-');
+
+    if (task.auth_waiting || task.status === 'BLOCKED_AUTH') {
+      showAuthNotice('请在浏览器完成登录后点击继续');
+    }
+
+    if (['SUCCESS', 'FAILED', 'CANCELLED'].includes(task.status)) {
+      clearInterval(timer);
+      onTaskFinished(task);
+    }
+  }, 2500);
+}
 ```
 
-环境变量：
+### 6.7 后端代理示例（Node.js）
+
+```js
+import express from 'express';
+import fetch from 'node-fetch';
+
+const app = express();
+app.use(express.json());
+
+const WEIQ_API = 'http://127.0.0.1:8080';
+
+app.post('/api/proxy/v1/tasks/crawl', async (req, res) => {
+  const r = await fetch(`${WEIQ_API}/v1/tasks/crawl`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(req.body)
+  });
+  res.status(r.status).json(await r.json());
+});
+
+app.get('/api/proxy/v1/tasks/:taskId', async (req, res) => {
+  const r = await fetch(`${WEIQ_API}/v1/tasks/${req.params.taskId}`);
+  res.status(r.status).json(await r.json());
+});
+
+app.listen(3000);
+```
+
+## 7. 常见问题与排查
+
+### 问题 1：点击开始后进度一直 0%
+
+排查顺序：
+1. 看任务日志是否出现 `DB_SCHEMA_MISMATCH` 或 `RUNTIME_CRASH`。
+2. 看子进程是否仍存活。
+3. 看 `heartbeat_at` 是否持续更新。
+4. 用“诊断”查看最后错误摘要。
+
+### 问题 2：登录页闪烁、反复跳转
+
+处理策略：
+- 等待登录态时任务进入 `BLOCKED_AUTH`；
+- 通过 `POST /v1/auth/session/{session_id}/submit` 和 `POST /v1/auth/session/{session_id}/check` 完成当前任务的远端临时登录；
+- 登录成功后任务重新入队继续；
+- 任务成功、失败、取消后默认删除 `runtime/auth_sessions/{session_id}/`。
+
+### 问题 3：导出文件不在预期目录
+
+检查：
+- 任务配置里的 `output_dir`。
+- 任务结果里的 `export_file`。
+- 如需归档，用“复制到目标目录”。
+
+## 8. 安全与敏感信息
+
+严禁提交到仓库的内容：
+- `runtime/auth_sessions/*/storage_state.json`
+- `runtime/auth_sessions/*/preview.png`
+- `state.json`
+- `*.db`
+- `accounts.xlsx`, `inputs/*.xlsx`
+- `数据导出_*.xlsx`, `latest.xlsx`
+- 任何 DSN、token、密码、cookie、私钥
+
+提交前建议执行：
 
 ```bash
-WEIQ_DB_PATH=/opt/weiq-scraper-stable-api/weiq_local.db
-WEIQ_API_RUNTIME_DIR=/opt/weiq-scraper-stable-api/runtime
-WEIQ_AUTH_STATE_DIR=/opt/weiq-scraper-stable-api/runtime/auth_sessions
-WEIQ_AUTH_SESSION_TTL_SECONDS=600
-WEIQ_KEEP_AUTH_STATE_FOR_DEBUG=false
-WEIQ_PROXY_SERVER=
-WEIQ_PROXY_USERNAME=
-WEIQ_PROXY_PASSWORD=
-WEIQ_PROXY_BYPASS=
+git status --short
+git diff --cached --name-only
+git grep -n "WEIQ_DB_DSN\|postgresql://\|password\|token\|state.json" || true
 ```
 
-说明：
-
-- `WEIQ_DB_PATH` 必须是绝对路径
-- 不要依赖当前工作目录生成 SQLite
-- worker 目前只支持单进程内存队列，必须 `--workers 1`
-- 如果配置 `WEIQ_PROXY_SERVER`，登录提交、抓取执行、Playwright 诊断、`httpx` 诊断都会走同一套代理出口
-
-## systemd 示例
-
-```ini
-[Unit]
-Description=WEIQ Scraper Stable API
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/weiq-scraper-stable-api
-Environment=WEIQ_DB_PATH=/opt/weiq-scraper-stable-api/weiq_local.db
-Environment=WEIQ_API_RUNTIME_DIR=/opt/weiq-scraper-stable-api/runtime
-Environment=WEIQ_AUTH_STATE_DIR=/opt/weiq-scraper-stable-api/runtime/auth_sessions
-Environment=WEIQ_AUTH_MODE=per_task
-Environment=WEIQ_KEEP_AUTH_STATE_FOR_DEBUG=false
-ExecStart=/usr/bin/xvfb-run -a /opt/weiq-scraper-stable-api/.venv/bin/python -m uvicorn cloud_api:app --host 127.0.0.1 --port 8080 --workers 1
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## 与 weibo 的边界
-
-- `weibo` 只需要配置 `WEIQ_CLOUD_API_BASE_URL=http://127.0.0.1:8080`
-- `weibo` 不需要 `WEIQ_CLOUD_SHARED_DIR`
-- `weibo` 不读取本仓库 DB
-- `weibo` 只通过 HTTP 调用本服务
-
-## Excel 输出兼容性
-
-导出 Excel 继续沿用原抓取字段，并兼容 `weibo` 的 importer：
-
-- `账号ID`
-- `uid`
-- `主页链接`
-- `认证等级`
-- `粉丝数`
-- `直发CPM`
-- `阅读中位数`
-- `直发阅读中位数`
-- `转发阅读中位数`
-- `互动中位数`
-- `直发互动中位数`
-- `转发互动中位数`
-- `发布博文数`
-- `转发中位数`
-- `评论中位数`
-- `点赞中位数`
-- `最低阅读量`
-- `最高阅读量`
-- `阅读量均值`
-
-`weibo` 侧会把 `认证等级` 识别为 `认证层级` 别名，因此不需要第二套导入逻辑。
-
-## 服务器出口被拦截
-
-如果 `/v1/debug/weiq-access` 返回 `blocked_detected=true`，说明代码链路基本正常，但当前 stable-api 运行环境访问 WEIQ 时被目标站点或中间网络拦截。
-
-典型表现：
-
-- `requests.blocked_detected=true`
-- `playwright.blocked_detected=true`
-- 页面标题出现 `The URL you requested has been blocked`
-
-这时不要继续重写抓取流程，优先处理网络出口：
-
-1. 更换能正常访问 WEIQ 的服务器。
-2. 把 stable-api 部署到本机或内网机器，再通过安全隧道让 `weibo` 调用。
-3. 配置稳定且合规的代理出口。
-4. 联系 WEIQ 放行 stable-api 所在服务器的出口 IP。
-
-## 验证
+## 9. 开发与测试
 
 ```bash
-./.venv/bin/python -m py_compile scraper.py scraper_runtime.py cloud_api.py
-./.venv/bin/python -m pytest tests/test_cloud_api.py tests/test_cli_compile.py
+python -m py_compile scraper.py desktop_app.py cloud_api.py src/weiq_core/contracts.py
+python -m unittest discover -s tests -p 'test_*.py'
 ```
+
+## 10. 更新记录
+
+详细更新请查看：[CHANGELOG.md](./CHANGELOG.md)

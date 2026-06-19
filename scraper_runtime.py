@@ -1,1128 +1,459 @@
-import colorsys
-import io
+import argparse
 import json
 import os
 import random
-import re
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import urlparse
+from typing import Any, Callable, Optional
+from uuid import uuid4
 
 import pandas as pd
-from PIL import Image
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
-# ==========================================
-# 配置与全局变量定义区
-# ==========================================
 INPUT_EXCEL = "accounts.xlsx"
 OUTPUT_EXCEL = "weiq_results.xlsx"
 STATE_JSON = "state.json"
-LOGIN_URL = "https://www.weiq.com/"
-DEFAULT_PROBE_UIDS = ["2115314532", "6557986019", "5099051423", "7331622139"]
-VERIFY_FILL_MAP = {
-    ("#FFFFFF", "#F6CA45", "#FFFFFF"): "黄V",
-    ("#FFFFFF", "#FF6C00", "#FFFFFF"): "橙V",
-    ("#FEFF78", "#CD3620", "#FEFF78"): "金V",
+STATE_STORE_JSON = "storage_state.json"
+
+METRIC_KEYS = [
+    "粉丝数",
+    "直发CPM",
+    "阅读中位数",
+    "直发阅读中位数",
+    "转发阅读中位数",
+    "互动中位数",
+    "直发互动中位数",
+    "转发互动中位数",
+    "发布博文数",
+    "转发中位数",
+    "评论中位数",
+    "点赞中位数",
+    "最低阅读量",
+    "最高阅读量",
+    "阅读量均值",
+]
+CRITICAL_METRIC_KEYS = ["粉丝数", "直发CPM", "阅读中位数", "发布博文数"]
+EMPTY_METRIC_MARKERS = {
+    "",
+    "-",
+    "--",
+    "空",
+    "空_无标签",
+    "空_无数据",
+    "暂无",
+    "未收录",
+    "未抓取",
+    "未获取",
+    "等待登录",
+    "待登录",
+    "登录失效",
 }
+LOGIN_HINT_KEYWORDS = [
+    "请先登录",
+    "登录后",
+    "立即登录",
+    "账号密码",
+    "手机号登录",
+    "手机验证码",
+    "发送验证码",
+    "获取验证码",
+    "短信验证码",
+]
+CAPTCHA_HINT_KEYWORDS = ["滑动验证", "安全访问验证", "请输入验证码", "访问过于频繁", "安全验证"]
+LOGIN_FORM_SELECTORS = [
+    "input[type='password']",
+    "input[placeholder*='密码']",
+    "input[placeholder*='验证码']",
+    "input[placeholder*='手机号']",
+    "input[placeholder*='账号']",
+    "input[placeholder*='用户名']",
+]
 
-global_request_count = 0
-
-
-@dataclass(slots=True)
-class ProxySettings:
-    server: str
-    username: str | None = None
-    password: str | None = None
-    bypass: str | None = None
-
-    def as_playwright_proxy(self) -> dict[str, str]:
-        payload = {"server": self.server}
-        if self.username:
-            payload["username"] = self.username
-        if self.password:
-            payload["password"] = self.password
-        if self.bypass:
-            payload["bypass"] = self.bypass
-        return payload
-
-    def as_httpx_proxy(self) -> str:
-        if not self.username:
-            return self.server
-        parsed = urlparse(self.server)
-        auth = self.username
-        if self.password:
-            auth = f"{auth}:{self.password}"
-        netloc = f"{auth}@{parsed.netloc}"
-        return parsed._replace(netloc=netloc).geturl()
-
-    def safe_server(self) -> str:
-        parsed = urlparse(self.server)
-        if parsed.scheme and parsed.hostname:
-            return f"{parsed.scheme}://{parsed.hostname}" if parsed.port is None else f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-        return self.server
+RESULT_META_KEYS = ["run_id", "crawl_time", "account_status", "error_code", "error_message"]
 
 
-class TaskStatus(str, Enum):
+class TaskStatus:
     PENDING = "PENDING"
     RUNNING = "RUNNING"
+    BLOCKED_AUTH = "BLOCKED_AUTH"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
 
-class ErrorCode(str, Enum):
-    INVALID_INPUT = "INVALID_INPUT"
-    LOGIN_REQUIRED = "LOGIN_REQUIRED"
-    STORAGE_STATE_INVALID = "STORAGE_STATE_INVALID"
-    ANTI_SPIDER = "ANTI_SPIDER"
-    PAGE_TIMEOUT = "PAGE_TIMEOUT"
-    RUNTIME_ERROR = "RUNTIME_ERROR"
+class AccountStatus:
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
     CANCELLED = "CANCELLED"
 
 
-@dataclass(slots=True)
-class CrawlHooks:
-    on_status: Callable[..., None] | None = None
-    is_cancelled: Callable[[], bool] | None = None
+class ErrorCode:
+    NONE = "NONE"
+    INVALID_UID = "INVALID_UID"
+    HTTP_BLOCKED = "HTTP_BLOCKED"
+    TIMEOUT = "TIMEOUT"
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    EMPTY_PAGE = "EMPTY_PAGE"
+    NAVIGATION_ERROR = "NAVIGATION_ERROR"
+    WRITE_ERROR = "WRITE_ERROR"
+    CANCELLED = "CANCELLED"
 
 
-@dataclass(slots=True)
+ERROR_MESSAGES_ZH = {
+    ErrorCode.NONE: "无错误",
+    ErrorCode.INVALID_UID: "账号缺少 uid 参数",
+    ErrorCode.HTTP_BLOCKED: "页面被拦截或返回异常状态",
+    ErrorCode.TIMEOUT: "页面响应超时",
+    ErrorCode.AUTH_REQUIRED: "登录态失效，需要手动登录",
+    ErrorCode.CAPTCHA_REQUIRED: "触发风控验证，需要手动处理",
+    ErrorCode.EMPTY_PAGE: "页面无有效数据，账号可能失效或未收录",
+    ErrorCode.NAVIGATION_ERROR: "页面读取报错",
+    ErrorCode.WRITE_ERROR: "结果写入失败",
+    ErrorCode.CANCELLED: "任务被取消",
+}
+
+
+@dataclass
 class CrawlConfig:
-    accounts: list[dict[str, Any]] | None = None
-    input_excel: str | None = None
-    output_excel: str | None = None
-    output_dir: str | None = None
-    state_storage: str | None = None
+    input_excel: str = INPUT_EXCEL
+    output_excel: str = OUTPUT_EXCEL
+    state_json: str = STATE_JSON
+    output_dir: str = "."
+    display: Optional[str] = None
     headless: bool = True
-    probe_verify: bool = False
-    probe_uids: list[str] = field(default_factory=lambda: list(DEFAULT_PROBE_UIDS))
-    require_login: bool = True
-    prompt_for_login_if_missing: bool = False
-    wait_on_anti_spider: bool = False
-    save_storage_state: bool = True
-    login_url: str = LOGIN_URL
+    cooldown_every: int = 50
+    cooldown_seconds: int = 180
+    wait_min_seconds: int = 2
+    wait_max_seconds: int = 4
+    goto_timeout_ms: int = 45000
+    network_idle_timeout_ms: int = 8000
+    retry_times: int = 1
+    retry_backoff_seconds: int = 3
+    resume: bool = True
+    run_id: Optional[str] = None
+    state_storage: str = STATE_STORE_JSON
 
 
-@dataclass(slots=True)
-class CrawlResult:
-    status: TaskStatus
-    output_excel: str | None
+@dataclass
+class CrawlHooks:
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None
+    should_stop: Optional[Callable[[], bool]] = None
+    on_auth_required: Optional[Callable[[str, str, Any, Any, str], bool]] = None
+
+
+@dataclass
+class CrawlRunResult:
+    run_id: str
+    status: str
     total_accounts: int
     processed_accounts: int
     success_accounts: int
     failed_accounts: int
     skipped_accounts: int
-    message: str
-    error_code: ErrorCode | None = None
+    started_at: str
+    finished_at: str
+    output_excel: str
+    error_code: str = ErrorCode.NONE
 
 
-def _emit_hook(hooks: CrawlHooks | None, **payload: Any) -> None:
-    if hooks and hooks.on_status:
-        hooks.on_status(**payload)
+@dataclass
+class AccountProcessResult:
+    metrics: dict[str, str] = field(default_factory=dict)
+    account_status: str = AccountStatus.FAILED
+    error_code: str = ErrorCode.NAVIGATION_ERROR
+    error_message: str = ERROR_MESSAGES_ZH[ErrorCode.NAVIGATION_ERROR]
 
 
-def _ensure_parent_dir(file_path: str) -> None:
-    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+class StateStore:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.data = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"version": 1, "last_run_id": None, "runs": {}}
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"version": 1, "last_run_id": None, "runs": {}}
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.path)
+
+    def ensure_run(self, run_id: str) -> None:
+        runs = self.data.setdefault("runs", {})
+        if run_id not in runs:
+            runs[run_id] = {
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+                "processed": {},
+            }
+        self.data["last_run_id"] = run_id
+        self._save()
+
+    def get_last_run_id(self) -> Optional[str]:
+        return self.data.get("last_run_id")
+
+    def is_processed(self, run_id: str, uid: str) -> bool:
+        run = self.data.get("runs", {}).get(run_id, {})
+        return uid in run.get("processed", {})
+
+    def mark_processed(self, run_id: str, uid: str, status: str, error_code: str) -> None:
+        run = self.data.setdefault("runs", {}).setdefault(
+            run_id,
+            {"created_at": now_iso(), "updated_at": now_iso(), "processed": {}},
+        )
+        run["processed"][uid] = {
+            "status": status,
+            "error_code": error_code,
+            "updated_at": now_iso(),
+        }
+        run["updated_at"] = now_iso()
+        self.data["last_run_id"] = run_id
+        self._save()
 
 
-def _clean_env_value(name: str) -> str | None:
-    value = os.environ.get(name)
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def load_proxy_settings_from_env() -> ProxySettings | None:
-    server = _clean_env_value("WEIQ_PROXY_SERVER")
-    if not server:
-        return None
-    return ProxySettings(
-        server=server,
-        username=_clean_env_value("WEIQ_PROXY_USERNAME"),
-        password=_clean_env_value("WEIQ_PROXY_PASSWORD"),
-        bypass=_clean_env_value("WEIQ_PROXY_BYPASS"),
-    )
+def emit_event(hooks: CrawlHooks, event: dict[str, Any]) -> None:
+    if hooks.on_event:
+        hooks.on_event(event)
 
 
-def get_playwright_launch_kwargs(*, headless: bool = True) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"headless": headless}
-    proxy = load_proxy_settings_from_env()
-    if proxy:
-        kwargs["proxy"] = proxy.as_playwright_proxy()
-    return kwargs
+def should_stop(hooks: CrawlHooks) -> bool:
+    if hooks.should_stop:
+        return hooks.should_stop()
+    return False
 
 
-def has_usable_storage_state(state_file: str | None) -> bool:
-    if not state_file:
-        return False
+def _normalize_metric_text(value: Any) -> str:
+    return str(value or "").strip().replace("\u3000", "").replace(" ", "").lower()
+
+
+def _is_empty_metric_value(value: Any) -> bool:
+    return _normalize_metric_text(value) in EMPTY_METRIC_MARKERS
+
+
+def _parse_metric_number(value: Any) -> float:
+    text = str(value or "").strip().replace(",", "").replace("¥", "").replace("元", "")
+    if not text or _is_empty_metric_value(text):
+        return 0.0
+    multiplier = 1.0
+    if text.endswith("万") or text.lower().endswith("w"):
+        multiplier = 10000.0
+        text = text[:-1]
+    elif text.lower().endswith("k"):
+        multiplier = 1000.0
+        text = text[:-1]
+    elif text.endswith("亿"):
+        multiplier = 100000000.0
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return 0.0
+
+
+def _count_effective_metrics(extracted_data: dict[str, str], keys: list[str]) -> int:
+    count = 0
+    for key in keys:
+        value = extracted_data.get(key)
+        if _is_empty_metric_value(value):
+            continue
+        if _parse_metric_number(value) > 0:
+            count += 1
+    return count
+
+
+def _safe_body_text(page) -> str:
+    try:
+        return page.locator("body").inner_text(timeout=2000) or ""
+    except Exception:
+        return ""
+
+
+def _page_has_visible_login_form(page) -> bool:
+    for selector in LOGIN_FORM_SELECTORS:
+        try:
+            locator = page.locator(selector)
+            count = min(locator.count(), 4)
+            for index in range(count):
+                if locator.nth(index).is_visible():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def infer_post_extraction_issue(
+    *,
+    page_url: str,
+    page_text: str,
+    has_login_form: bool,
+    extracted_data: dict[str, str],
+) -> str:
+    merged_text = f"{page_url}\n{page_text}".lower()
+    if any(keyword.lower() in merged_text for keyword in CAPTCHA_HINT_KEYWORDS):
+        return ErrorCode.CAPTCHA_REQUIRED
+
+    core_valid_count = _count_effective_metrics(extracted_data, CRITICAL_METRIC_KEYS)
+    if core_valid_count >= 2:
+        return ErrorCode.NONE
+
+    if has_login_form or any(keyword.lower() in merged_text for keyword in LOGIN_HINT_KEYWORDS):
+        return ErrorCode.AUTH_REQUIRED
+
+    overall_valid_count = _count_effective_metrics(extracted_data, METRIC_KEYS)
+    if overall_valid_count == 0:
+        return ErrorCode.EMPTY_PAGE
+
+    return ErrorCode.EMPTY_PAGE
+
+
+def default_auth_handler(reason_code: str, page_url: str, page=None, context=None, state_file: str = STATE_JSON) -> bool:
+    print(f"\n[风控警告] 触发 {reason_code}，当前页面: {page_url}")
+    print(">>>>> 请立即在浏览器中手动登录或验证，处理完成后回到终端继续 <<<<<")
+    input("====> 处理完毕后按回车继续：")
+    if context is not None:
+        try:
+            context.storage_state(path=state_file)
+        except Exception:
+            pass
+    print("[恢复] 已收到继续信号，准备重试当前账号。\n")
+    time.sleep(2)
+    return True
+
+
+def resolve_output_path(output_dir: str, output_excel: str) -> str:
+    output_dir = output_dir or "."
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = Path(output_excel)
+    if out_path.is_absolute():
+        return str(out_path)
+    return str((out_dir / out_path).resolve())
+
+
+def has_usable_storage_state(state_file: str) -> bool:
     path = Path(state_file)
-    if not path.exists() or path.stat().st_size == 0:
+    if not path.exists():
         return False
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return False
-
     cookies = payload.get("cookies")
     origins = payload.get("origins")
-    return isinstance(cookies, list) and isinstance(origins, list) and (len(cookies) > 0 or len(origins) > 0)
+    return bool(cookies or origins)
 
 
-def init_env(output_excel: str = OUTPUT_EXCEL):
-    if os.path.exists(output_excel):
-        try:
-            df_old = pd.read_excel(output_excel)
-            required_cols = ["粉丝数", "最低阅读量", "认证等级"]
-            if any(col not in df_old.columns for col in required_cols):
-                backup_path = Path(output_excel).with_name(
-                    f"{Path(output_excel).stem}_旧版备份_{datetime.now().strftime('%Y%m%d%H%M%S')}{Path(output_excel).suffix or '.xlsx'}"
-                )
-                os.rename(output_excel, backup_path)
-                print(f"[系统保护] 检测到旧版本或结构不匹配的表格，已自动重命名为: {backup_path}")
-                print(f"[系统保护] 本次运行将创建一张包含15项核心指标 + 认证等级的新结果表。\n")
-        except Exception:
-            os.remove(output_excel)
+def get_playwright_launch_kwargs(*, headless: bool = True) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"headless": headless}
+    server = str(os.getenv("WEIQ_PROXY_SERVER") or "").strip()
+    if not server:
+        return kwargs
+    proxy: dict[str, str] = {"server": server}
+    for env_name, key in (
+        ("WEIQ_PROXY_USERNAME", "username"),
+        ("WEIQ_PROXY_PASSWORD", "password"),
+        ("WEIQ_PROXY_BYPASS", "bypass"),
+    ):
+        value = str(os.getenv(env_name) or "").strip()
+        if value:
+            proxy[key] = value
+    kwargs["proxy"] = proxy
+    return kwargs
 
 
-def init_browser(p: Playwright, *, headless: bool = True, state_storage: str | None = None) -> tuple[Browser, BrowserContext, Page]:
-    print("[初始化] 正在启动浏览器...")
-    browser = p.chromium.launch(**get_playwright_launch_kwargs(headless=headless))
+def load_accounts(input_excel: str) -> pd.DataFrame:
+    df = pd.read_excel(input_excel)
+    if "uid" not in df.columns:
+        raise ValueError("输入表缺少 uid 列")
+    if "账号ID" not in df.columns:
+        df["账号ID"] = "未命名账号"
+    return df
 
-    if has_usable_storage_state(state_storage):
-        print(f"[初始化] 检测到凭证文件 {state_storage}，尝试以已登录状态恢复会话。")
-        context = browser.new_context(storage_state=state_storage)
+
+def to_atomic_excel(path: str, df: pd.DataFrame) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=str(target.parent), suffix=".xlsx", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        df.to_excel(tmp_path, index=False)
+        os.replace(tmp_path, target)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def safe_append_row(path: str, row_dict: dict[str, Any]) -> None:
+    row_df = pd.DataFrame([row_dict])
+    target = Path(path)
+
+    if target.exists():
+        old_df = pd.read_excel(target)
+        all_df = pd.concat([old_df, row_df], ignore_index=True, sort=False)
     else:
-        print(f"[警告] 未检测到凭证文件，将以未登录状态启动！")
+        all_df = row_df
+
+    to_atomic_excel(str(target), all_df)
+
+
+def init_browser(playwright_obj, state_file: str, headless: bool, *, display: Optional[str] = None):
+    print("[初始化] 正在启动浏览器...")
+    launch_kwargs = get_playwright_launch_kwargs(headless=headless)
+    if display:
+        launch_kwargs["env"] = {**os.environ, "DISPLAY": display}
+    browser = playwright_obj.chromium.launch(**launch_kwargs)
+
+    if os.path.exists(state_file):
+        print(f"[初始化] 检测到凭证文件 {state_file}，尝试恢复会话。")
+        context = browser.new_context(storage_state=state_file)
+    else:
+        print("[警告] 未检测到凭证文件，将以未登录状态启动。")
         context = browser.new_context()
 
     page = context.new_page()
     return browser, context, page
 
 
-def parse_probe_uids(raw):
-    return [x.strip() for x in str(raw).split(",") if x.strip()]
-
-
-def _normalize_signal_text(raw):
-    text = str(raw or "").strip().lower()
-    text = text.replace("：", ":")
-    text = re.sub(r"\s+", "", text)
-    return text
-
-
-def _normalize_hex_color(raw):
-    text = str(raw or "").strip().upper()
-    if not text:
-        return ""
-    if re.fullmatch(r"#[0-9A-F]{3}", text):
-        return "#" + "".join(ch * 2 for ch in text[1:])
-    if re.fullmatch(r"#[0-9A-F]{6}", text):
-        return text
-    m = re.search(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", text.lower())
-    if m:
-        return "#{:02X}{:02X}{:02X}".format(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    return text
-
-
-def _to_number_color_triplet(raw):
-    if not raw:
-        return None
-    m = re.search(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", str(raw).lower())
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-
-def _color_distance(c1, c2):
-    return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2 + (c1[2] - c2[2]) ** 2) ** 0.5
-
-
-def _rgb_to_hsv_255(r, g, b):
-    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
-    return h * 360.0, s * 255.0, v * 255.0
-
-
-def _classify_hue_bucket(h):
-    # 经验区间：金红(偏红) < 橙 < 黄
-    if h < 12:
-        return "金V"
-    if h < 42:
-        return "橙V"
-    if h < 70:
-        return "黄V"
-    return None
-
-
-def _match_verify_level_from_rgb_text_signals(signals):
-    votes = {"金V": 0.0, "橙V": 0.0, "黄V": 0.0}
-    for s in signals:
-        text = str(s or "").lower()
-        for m in re.finditer(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", text):
-            r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            h, sat, val = _rgb_to_hsv_255(r, g, b)
-            if sat < 35 or val < 60:
-                continue
-            level = _classify_hue_bucket(h)
-            if not level:
-                continue
-            votes[level] += (sat / 255.0) * (val / 255.0)
-    total = sum(votes.values())
-    if total <= 0:
-        return None
-    ordered = sorted(votes.items(), key=lambda x: x[1], reverse=True)
-    top_level, top_score = ordered[0]
-    second_score = ordered[1][1]
-    ratio = top_score / total
-    margin = (top_score - second_score) / total
-    if top_level == "金V":
-        if ratio >= 0.72 and margin >= 0.26:
-            return "金V"
-        if votes["橙V"] >= top_score * 0.55:
-            return "橙V"
-        return None
-    if ratio >= 0.52 and margin >= 0.10:
-        return top_level
-    return None
-
-
-def _match_verify_level_by_semantic_color(signals):
-    # 仅在“昵称邻域已确认有认证图标但缺少语义 token”时作为样式语义兜底，不做像素取色。
-    colors = []
-    for s in signals:
-        t = str(s).lower()
-        if "style:color=" in t or "style:fill=" in t or "style:stroke=" in t:
-            for part in re.split(r"[;|]", t):
-                if "rgb(" in part:
-                    c = _to_number_color_triplet(part)
-                    if c:
-                        colors.append(c)
-    if not colors:
-        return None
-
-    # 排除低饱和灰阶，减少误把正文黑灰色当成认证色
-    colors = [c for c in colors if (max(c) - min(c)) >= 18]
-    if not colors:
-        return None
-
-    score = {"金V": 0.0, "橙V": 0.0, "黄V": 0.0}
-    total = 0.0
-    for r, g, b in colors:
-        h, s, v = _rgb_to_hsv_255(r, g, b)
-        if s < 35 or v < 70:
-            continue
-        level = _classify_hue_bucket(h)
-        if not level:
-            continue
-        w = (s / 255.0) * (v / 255.0)
-        score[level] += w
-        total += w
-
-    if total <= 0:
-        return None
-    ordered = sorted(score.items(), key=lambda x: x[1], reverse=True)
-    top_level, top_score = ordered[0]
-    second_score = ordered[1][1]
-    ratio = top_score / total
-    margin = (top_score - second_score) / total
-    # 金V门槛更严，防止橙V被暗红阴影误吸到金V
-    if top_level == "金V":
-        if ratio >= 0.72 and margin >= 0.26:
-            return top_level
-        if score.get("橙V", 0.0) >= top_score * 0.55:
-            return "橙V"
-        return None
-    if ratio >= 0.55 and margin >= 0.15:
-        return top_level
-    return None
-
-
-def _classify_verify_by_region_screenshot(page, dom_probe):
-    try:
-        rect = dom_probe.get("name_rect") or {}
-        card_rect = dom_probe.get("card_rect") or {}
-        nl = float(rect.get("left", 0))
-        nt = float(rect.get("top", 0))
-        nw = float(rect.get("width", 0))
-        nh = float(rect.get("height", 0))
-        cr = float(card_rect.get("right", 0))
-        cb = float(card_rect.get("bottom", 0))
-        if nw <= 0 or nh <= 0:
-            return None, {}
-
-        x = max(nl + nw - 2, 0)
-        y = max(nt - 6, 0)
-        max_w = max(cr - x - 2, 0)
-        w = min(140, max_w)
-        h = min(max(nh + 12, 24), max(cb - y - 2, 0))
-        if w < 12 or h < 12:
-            return None, {}
-
-        png = page.screenshot(clip={"x": x, "y": y, "width": w, "height": h})
-        img = Image.open(io.BytesIO(png)).convert("RGB")
-        pixels = img.get_flattened_data()
-        if not pixels:
-            return None, {}
-
-        hit_counts = {"金V": 0.0, "橙V": 0.0, "黄V": 0.0}
-        colorful_count = 0
-        valid_count = 0
-        for r, g, b in pixels:
-            if max(r, g, b) - min(r, g, b) < 20:
-                continue
-            colorful_count += 1
-            h_deg, s, v = _rgb_to_hsv_255(r, g, b)
-            if s < 45 or v < 85:
-                continue
-            level = _classify_hue_bucket(h_deg)
-            if not level:
-                continue
-            valid_count += 1
-            hit_counts[level] += (s / 255.0) * (v / 255.0)
-
-        # 区域内有效彩色像素过少，视为证据不足
-        if valid_count < 5:
-            return None, {"colorful_pixels": colorful_count, "valid_pixels": valid_count, "hit_scores": hit_counts}
-
-        level, score = max(hit_counts.items(), key=lambda x: x[1])
-        total_score = sum(hit_counts.values()) or 1.0
-        ordered = sorted(hit_counts.items(), key=lambda x: x[1], reverse=True)
-        ratio = score / total_score
-        margin = (ordered[0][1] - ordered[1][1]) / total_score
-        if level == "金V":
-            if ratio >= 0.72 and margin >= 0.26:
-                return level, {
-                    "clip": {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)},
-                    "colorful_pixels": colorful_count,
-                    "valid_pixels": valid_count,
-                    "hit_scores": hit_counts,
-                    "ratio": round(ratio, 4),
-                    "margin": round(margin, 4),
-                }
-            if hit_counts.get("橙V", 0.0) >= score * 0.55:
-                return "橙V", {
-                    "clip": {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)},
-                    "colorful_pixels": colorful_count,
-                    "valid_pixels": valid_count,
-                    "hit_scores": hit_counts,
-                    "ratio": round(ratio, 4),
-                    "margin": round(margin, 4),
-                    "demote_from_gold": True,
-                }
-            return None, {
-                "colorful_pixels": colorful_count,
-                "valid_pixels": valid_count,
-                "hit_scores": hit_counts,
-                "ratio": round(ratio, 4),
-                "margin": round(margin, 4),
-                "gold_conf_low": True,
-            }
-
-        if ratio >= 0.58 and margin >= 0.18:
-            return level, {
-                "clip": {"x": round(x, 2), "y": round(y, 2), "width": round(w, 2), "height": round(h, 2)},
-                "colorful_pixels": colorful_count,
-                "valid_pixels": valid_count,
-                "hit_scores": hit_counts,
-                "ratio": round(ratio, 4),
-                "margin": round(margin, 4),
-            }
-        return None, {
-            "colorful_pixels": colorful_count,
-            "valid_pixels": valid_count,
-            "hit_scores": hit_counts,
-            "ratio": round(ratio, 4),
-            "margin": round(margin, 4),
-        }
-    except Exception as e:
-        return None, {"error": str(e)}
-
-
-def _has_verify_semantic_hint(signals):
-    normalized = " | ".join(_normalize_signal_text(x) for x in signals if x)
-    if not normalized:
-        return False
-    return bool(
-        re.search(
-            r"(verify|verified|auth|badge|vip|renzheng|认证|gold|orange|yellow|huang|cheng|jin|hong|red|weibo[-_]?v|icon[-_]?v|vip[-_]?icon|金v|橙v|黄v)",
-            normalized,
-        )
-    )
-
-
-def _match_verify_level_from_signals(signals):
-    normalized = " | ".join(_normalize_signal_text(x) for x in signals if x)
-    if not normalized:
-        return None
-
-    gold_tokens = [
-        "金v", "goldv", "gold_v", "gold-", "v-gold", "v_gold", "goldenv", "金红",
-        "redv", "red_v", "v-red", "jinv", "jin_v", "v-jin", "hongv", "hong_v",
-    ]
-    orange_tokens = [
-        "橙v", "orangev", "orange_v", "orange-", "v-orange", "v_orange",
-        "chengv", "cheng_v", "v-cheng",
-    ]
-    yellow_tokens = [
-        "黄v", "yellowv", "yellow_v", "yellow-", "v-yellow", "v_yellow",
-        "huangv", "huang_v", "v-huang",
-    ]
-
-    for token in gold_tokens:
-        if token in normalized:
-            return "金V"
-    for token in orange_tokens:
-        if token in normalized:
-            return "橙V"
-    for token in yellow_tokens:
-        if token in normalized:
-            return "黄V"
-
-    return None
-
-
-def _extract_api_verify_clues(payload):
-    clues = []
-    max_clues = 200
-    verify_key_tokens = ("verify", "verified", "auth", "vip", "renzheng", "认证", "vtype", "v_type", "badge")
-
-    def walk(node, path="root", depth=0):
-        if depth > 8 or len(clues) >= max_clues:
-            return
-
-        if isinstance(node, dict):
-            for k, v in node.items():
-                key = str(k)
-                next_path = f"{path}.{key}"
-                key_l = key.lower()
-                if any(t in key_l for t in verify_key_tokens):
-                    if isinstance(v, (str, int, float, bool)) or v is None:
-                        clues.append(f"{next_path}={v}")
-                walk(v, next_path, depth + 1)
-        elif isinstance(node, list):
-            for i, item in enumerate(node[:60]):
-                walk(item, f"{path}[{i}]", depth + 1)
-        elif isinstance(node, str):
-            node_l = node.lower()
-            if any(t in node_l for t in verify_key_tokens):
-                clues.append(f"{path}={node}")
-
-    walk(payload)
-    return clues
-
-
-def _extract_json_from_text_payload(text):
-    # 兼容 text/plain 包裹 JSON 的接口
-    if not text:
-        return None
-    raw = text.strip()
-    if not raw:
-        return None
-    if raw.startswith("{") or raw.startswith("["):
-        try:
-            return json.loads(raw)
-        except Exception:
-            return None
-    return None
-
-
-def _resolve_verify_level_from_api_payloads(api_payloads):
-    all_clues = []
-    for item in api_payloads:
-        for clue in item.get("clues", []):
-            all_clues.append(clue)
-    return _match_verify_level_from_signals(all_clues), all_clues
-
-
-def _extract_verify_level_from_exact_svg(page):
-    js = r"""
-    () => {
-      const out = {
-        has_profile_card: false,
-        has_name_row: false,
-        has_verify_icon: false,
-        has_verify_text: false,
-        has_unverified_hint: false,
-        verify_text_value: '',
-        svg_found: false,
-        svg_class: '',
-        svg_html: '',
-        path_fills: [],
-        top_lines: []
-      };
-
-      const all = Array.from(document.querySelectorAll('*'));
-      const card = all.find(el => {
-        const t = (el.innerText || '').trim();
-        return t.includes('UID') && t.includes('粉丝数') && t.includes('博文总数');
-      });
-      if (!card) return out;
-
-      out.has_profile_card = true;
-      const topLines = (card.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, 20);
-      out.top_lines = topLines;
-
-      const normalize = (s) => String(s || '').replace(/\s+/g, '');
-      const isNegative = (s) => {
-        const v = normalize(s).toLowerCase();
-        if (!v) return false;
-        if (/^[-—–~～_=·*xX\/]+$/.test(v)) return true;
-        if (['无', '暂无', '未认证', 'none', 'null', 'na', 'n/a'].includes(v)) return true;
-        return false;
-      };
-
-      let verifyTextValue = '';
-      for (const line of topLines) {
-        if (!line.includes('认证信息')) continue;
-        const m = line.match(/认证信息\s*[：:]?\s*(.*)$/);
-        const tail = m ? (m[1] || '') : line.split('认证信息').slice(1).join('');
-        const cleaned = String(tail || '').trim();
-        if (cleaned && !verifyTextValue) verifyTextValue = cleaned;
-      }
-      out.verify_text_value = verifyTextValue;
-      out.has_verify_text = Boolean(verifyTextValue && !isNegative(verifyTextValue));
-      out.has_unverified_hint = Boolean(verifyTextValue) && isNegative(verifyTextValue);
-
-      const nameRow = card.querySelector('.user-name-text.pointer');
-      if (!nameRow) return out;
-
-      out.has_name_row = true;
-      const svg = nameRow.querySelector('svg.gl-icon-default.icon.v.ml4');
-      if (!svg) return out;
-
-      out.has_verify_icon = true;
-      out.svg_found = true;
-      out.svg_class = svg.getAttribute('class') || '';
-      out.svg_html = (svg.outerHTML || '').slice(0, 1600);
-      out.path_fills = Array.from(svg.querySelectorAll('path'))
-        .map(p => p.getAttribute('fill') || '')
-        .filter(Boolean);
-      return out;
-    }
-    """
-    return page.evaluate(js)
-
-
-def _probe_verify_dom(page):
-    js = r"""
-    () => {
-      const out = {
-        has_verify_icon: false,
-        has_profile_card: false,
-        has_verify_text: false,
-        has_unverified_hint: false,
-        has_name_row: false,
-        verify_text_value: '',
-        name_rect: null,
-        card_rect: null,
-        signals: [],
-        name_row_signals: [],
-        icon_style_signals: [],
-        icon_nodes: [],
-        top_lines: []
-      };
-
-      const all = Array.from(document.querySelectorAll('*'));
-      let uidEl = all.find(el => (el.innerText || '').includes('UID：') || (el.innerText || '').includes('UID:'));
-      let card = null;
-
-      if (uidEl) {
-        let p = uidEl;
-        for (let i = 0; i < 7 && p; i++) {
-          const t = p.innerText || '';
-          if (t.includes('粉丝数') && t.includes('博文总数')) {
-            card = p;
-            break;
-          }
-          p = p.parentElement;
-        }
-      }
-
-      if (!card) {
-        card = all.find(el => {
-          const t = el.innerText || '';
-          return t.includes('UID') && t.includes('粉丝数') && t.includes('博文总数');
-        }) || null;
-      }
-
-      if (!card) {
-        return out;
-      }
-      out.has_profile_card = true;
-      const _cr = card.getBoundingClientRect();
-      out.card_rect = {left: _cr.left, top: _cr.top, right: _cr.right, bottom: _cr.bottom, width: _cr.width, height: _cr.height};
-
-      const topLines = (card.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, 20);
-      out.top_lines = topLines;
-      const normalize = (s) => String(s || '').replace(/\s+/g, '');
-      const isNegative = (s) => {
-        const v = normalize(s).toLowerCase();
-        if (!v) return false;
-        if (/^[-—–~～_=·*xX\/]+$/.test(v)) return true;
-        if (['无', '暂无', '未认证', 'none', 'null', 'na', 'n/a'].includes(v)) return true;
-        return false;
-      };
-      let verifyTextValue = '';
-      for (const line of topLines) {
-        if (!line.includes('认证信息')) continue;
-        const m = line.match(/认证信息\s*[：:]?\s*(.*)$/);
-        const tail = m ? (m[1] || '') : line.split('认证信息').slice(1).join('');
-        const cleaned = String(tail || '').trim();
-        if (cleaned && !verifyTextValue) verifyTextValue = cleaned;
-      }
-      out.verify_text_value = verifyTextValue;
-      out.has_verify_text = Boolean(verifyTextValue && !isNegative(verifyTextValue));
-      out.has_unverified_hint = Boolean(verifyTextValue) && isNegative(verifyTextValue);
-
-      const uidTextNode = Array.from(card.querySelectorAll('*')).find(el => {
-        const t = (el.innerText || '').trim();
-        return t.startsWith('UID：') || t.startsWith('UID:') || /^UID[：:]\s*\d+/.test(t);
-      });
-
-      const cardRect = card.getBoundingClientRect();
-      let nameRow = null;
-      let nicknameEl = null;
-      if (uidTextNode && uidTextNode.parentElement) {
-        const siblings = Array.from(uidTextNode.parentElement.children);
-        const uidIdx = siblings.indexOf(uidTextNode);
-        if (uidIdx > 0) {
-          const prev = siblings[uidIdx - 1];
-          const prevText = (prev.innerText || '').trim();
-          if (prevText && !prevText.includes('UID') && prevText.length <= 40) {
-            nameRow = prev;
-            nicknameEl = prev;
-          }
-        }
-      }
-
-      const uidRect = uidTextNode ? uidTextNode.getBoundingClientRect() : null;
-      const maybeNames = Array.from(card.querySelectorAll('*')).filter(el => {
-          if (!el || !el.getBoundingClientRect) return false;
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 16 || rect.height < 12) return false;
-          if (rect.top < cardRect.top || rect.bottom > cardRect.bottom + 1) return false;
-          const t = (el.innerText || '').trim();
-          if (!t) return false;
-          if (t.includes('UID') || t.includes('粉丝数') || t.includes('博文总数') || t.includes('转评赞总数')) return false;
-          if (t.length > 30) return false;
-          if (uidRect) {
-            if (rect.top > uidRect.top) return false;
-            if ((uidRect.top - rect.top) > 80) return false;
-          }
-          return true;
-        });
-
-      if (!nicknameEl && maybeNames.length > 0) {
-        maybeNames.sort((a, b) => {
-          const ar = a.getBoundingClientRect();
-          const br = b.getBoundingClientRect();
-          const ay = uidRect ? Math.abs(uidRect.top - ar.top) : ar.top;
-          const by = uidRect ? Math.abs(uidRect.top - br.top) : br.top;
-          if (ay !== by) return ay - by;
-          return ar.left - br.left;
-        });
-        nicknameEl = maybeNames[0];
-      }
-
-      if (!nameRow && nicknameEl) {
-        nameRow = nicknameEl.parentElement || nicknameEl;
-      }
-
-      // 二次兜底：按 UID 上方近邻文本推断昵称行（解决“昵称与 UID 非同父结构”的页面）
-      if (!nicknameEl && uidRect) {
-        const textCandidates = Array.from(card.querySelectorAll('*')).filter(el => {
-          if (!el || !el.getBoundingClientRect) return false;
-          const t = (el.innerText || '').trim();
-          if (!t) return false;
-          if (t.includes('UID') || t.includes('粉丝数') || t.includes('博文总数') || t.includes('转评赞总数')) return false;
-          if (t.length > 30) return false;
-          const r = el.getBoundingClientRect();
-          if (r.width < 12 || r.height < 12) return false;
-          if (r.bottom > uidRect.top + 8) return false;
-          if (r.top < uidRect.top - 110) return false;
-          if (r.left < cardRect.left - 2 || r.right > cardRect.right + 2) return false;
-          return true;
-        });
-        if (textCandidates.length > 0) {
-          textCandidates.sort((a, b) => {
-            const ar = a.getBoundingClientRect();
-            const br = b.getBoundingClientRect();
-            const dy = Math.abs(uidRect.top - ar.bottom) - Math.abs(uidRect.top - br.bottom);
-            if (dy !== 0) return dy;
-            return (br.width - ar.width);
-          });
-          nicknameEl = textCandidates[0];
-          nameRow = nicknameEl.parentElement || nicknameEl;
-        }
-      }
-
-      if (!nameRow && maybeNames.length > 0) {
-        for (const el of maybeNames) {
-          if (el.querySelector && el.querySelector('img,svg,use,i,span,em')) {
-            nameRow = el;
-            nicknameEl = el;
-            break;
-          }
-        }
-      }
-
-      if (!nameRow) {
-        return out;
-      }
-      out.has_name_row = true;
-
-      const nameRect = nicknameEl && nicknameEl.getBoundingClientRect ? nicknameEl.getBoundingClientRect() : nameRow.getBoundingClientRect();
-      const rowRect = nameRow.getBoundingClientRect();
-      out.name_rect = {left: nameRect.left, top: nameRect.top, right: nameRect.right, bottom: nameRect.bottom, width: nameRect.width, height: nameRect.height};
-
-      const nodes = Array.from(nameRow.querySelectorAll('*'));
-      const signalSet = new Set();
-      const nameRowSignalSet = new Set();
-      const iconStyleSet = new Set();
-      const iconNodes = [];
-      let siblingIconHit = false;
-      let pseudoIconHit = false;
-
-      const addComputedStyleSignals = (node, bucket, iconBucket) => {
-        const style = window.getComputedStyle(node);
-        if (!style) return;
-        const keys = ['color', 'fill', 'stroke', 'backgroundImage', 'backgroundColor', 'filter'];
-        for (const key of keys) {
-          const v = style[key];
-          if (!v) continue;
-          const val = String(v).trim();
-          if (!val || val === 'none') continue;
-          const signal = `style:${key}=${val}`;
-          bucket.add(signal);
-          if (iconBucket) iconBucket.add(signal);
-        }
-      };
-
-      const collectAttrs = (node) => {
-        const attrs = [];
-        for (const key of ['class', 'src', 'href', 'xlink:href', 'style', 'title', 'aria-label', 'alt', 'data-type', 'data-level', 'data-verify', 'data-vip', 'name']) {
-          const v = node.getAttribute && node.getAttribute(key);
-          if (v) attrs.push(`${key}=${v}`);
-        }
-        const text = ((node.textContent || '') + '').trim();
-        if (text && text.length <= 20) attrs.push(`text=${text}`);
-        return attrs;
-      };
-
-      const collectPseudoSignals = (node, label) => {
-        if (!node || !window.getComputedStyle) return;
-        for (const pseudo of ['::before', '::after']) {
-          let st = null;
-          try {
-            st = window.getComputedStyle(node, pseudo);
-          } catch (e) {
-            st = null;
-          }
-          if (!st) continue;
-
-          const content = String(st.content || '').trim();
-          const width = String(st.width || '').trim();
-          const height = String(st.height || '').trim();
-          const color = String(st.color || '').trim();
-          const fill = String(st.fill || '').trim();
-          const stroke = String(st.stroke || '').trim();
-          const bg = String(st.backgroundImage || '').trim();
-          const bgc = String(st.backgroundColor || '').trim();
-          const mask = String(st.maskImage || st.webkitMaskImage || '').trim();
-
-          const styleLine = `pseudo:${label}:${pseudo}|content=${content}|w=${width}|h=${height}|color=${color}|fill=${fill}|stroke=${stroke}|bg=${bg}|bgc=${bgc}|mask=${mask}`.toLowerCase();
-          nameRowSignalSet.add(styleLine);
-          signalSet.add(styleLine);
-          iconStyleSet.add(`style:color=${color}`);
-          iconStyleSet.add(`style:fill=${fill}`);
-          iconStyleSet.add(`style:stroke=${stroke}`);
-          iconStyleSet.add(`style:backgroundColor=${bgc}`);
-
-          const hasVisual = (
-            (content && content !== 'none' && content !== 'normal' && content !== '""' && content !== "''") ||
-            (bg && bg !== 'none') ||
-            (mask && mask !== 'none')
-          );
-          if (hasVisual) pseudoIconHit = true;
-        }
-      };
-
-      const iconSelector = 'img,svg,use,i,span,em';
-      const iconCandidates = Array.from(card.querySelectorAll(iconSelector));
-      for (const node of nodes) {
-        const attrs = collectAttrs(node);
-        const raw = attrs.join(' | ').toLowerCase();
-        const hasKeyword = /(verify|verified|auth|badge|vip|renzheng|认证|gold|orange|yellow|huang|cheng|jin|hong|red|金v|橙v|黄v|\\bv\\b)/.test(raw);
-        if (hasKeyword && raw.length > 0) {
-          signalSet.add(raw);
-          nameRowSignalSet.add(raw);
-        }
-      }
-
-      const nicknameRight = nameRect.right;
-      const rowTop = rowRect.top;
-      const rowBottom = rowRect.bottom;
-      const nameTop = nameRect.top;
-      const nameBottom = nameRect.bottom;
-      const nearIconCandidates = [];
-      for (const node of iconCandidates) {
-        if (!node || !node.getBoundingClientRect) continue;
-        const rect = node.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        if (rect.width > 30 || rect.height > 30) continue;
-
-        const centerY = rect.top + rect.height / 2;
-        const alignedRow = centerY >= (rowTop - 7) && centerY <= (rowBottom + 7);
-        const alignedName = centerY >= (nameTop - 8) && centerY <= (nameBottom + 8);
-        const rightOfName = rect.left >= (nicknameRight - 8);
-        const nearName = rect.left <= (nicknameRight + 140);
-        if (!(alignedRow || alignedName)) continue;
-        if (!(rightOfName && nearName)) continue;
-        if (rect.top < cardRect.top || rect.bottom > cardRect.bottom + 1) continue;
-
-        nearIconCandidates.push(node);
-      }
-
-      for (const node of nearIconCandidates) {
-        const tag = node.tagName.toLowerCase();
-        const rect = node.getBoundingClientRect();
-        const attrs = collectAttrs(node);
-        const raw = attrs.join(' | ').toLowerCase();
-        const st = window.getComputedStyle(node);
-        const summary = `${tag}|w=${Math.round(rect.width)}|h=${Math.round(rect.height)}|${raw}|style_color=${st ? st.color : ''}|style_fill=${st ? st.fill : ''}|style_stroke=${st ? st.stroke : ''}`.trim();
-        iconNodes.push(summary);
-        signalSet.add(summary);
-        nameRowSignalSet.add(summary);
-
-        addComputedStyleSignals(node, nameRowSignalSet, iconStyleSet);
-        if (node.parentElement) addComputedStyleSignals(node.parentElement, nameRowSignalSet, iconStyleSet);
-        if (node.parentElement && node.parentElement.parentElement) {
-          addComputedStyleSignals(node.parentElement.parentElement, nameRowSignalSet, iconStyleSet);
-        }
-
-        if (/(v|vip|verify|badge|认证|gold|orange|yellow|huang|cheng|jin|hong|red)/i.test(summary)) {
-          signalSet.add(summary.toLowerCase());
-          nameRowSignalSet.add(summary.toLowerCase());
-        }
-      }
-
-      // 兜底：昵称文本节点的右侧兄弟节点里，很多站点会把认证图标挂在这里
-      if (nicknameEl && nicknameEl.parentElement) {
-        const siblings = Array.from(nicknameEl.parentElement.children || []);
-        for (const sib of siblings) {
-          if (!sib || sib === nicknameEl || !sib.getBoundingClientRect) continue;
-          const r = sib.getBoundingClientRect();
-          if (r.width <= 0 || r.height <= 0) continue;
-          if (r.left < (nicknameRight - 6) || r.left > (nicknameRight + 160)) continue;
-          const centerY = r.top + r.height / 2;
-          if (centerY < (nameTop - 10) || centerY > (nameBottom + 10)) continue;
-          const attrs = collectAttrs(sib);
-          const summary = `${sib.tagName.toLowerCase()}|w=${Math.round(r.width)}|h=${Math.round(r.height)}|${attrs.join(' | ').toLowerCase()}`;
-          iconNodes.push(summary);
-          signalSet.add(summary);
-          nameRowSignalSet.add(summary);
-          addComputedStyleSignals(sib, nameRowSignalSet, iconStyleSet);
-          siblingIconHit = true;
-        }
-      }
-
-      // 关键兜底：很多站点把认证图标做成昵称元素的伪元素，而非真实节点
-      collectPseudoSignals(nicknameEl, 'nickname');
-      collectPseudoSignals(nameRow, 'name_row');
-      if (nicknameEl && nicknameEl.parentElement) {
-        collectPseudoSignals(nicknameEl.parentElement, 'name_parent');
-      }
-
-      out.has_verify_icon = nearIconCandidates.length > 0 || siblingIconHit || pseudoIconHit;
-      out.signals = Array.from(signalSet).slice(0, 80);
-      out.name_row_signals = Array.from(nameRowSignalSet).slice(0, 120);
-      out.icon_style_signals = Array.from(iconStyleSet).slice(0, 80);
-      out.icon_nodes = iconNodes.slice(0, 30);
-      return out;
-    }
-    """
-    return page.evaluate(js)
-
-
-def _extract_inline_verify_clues(page):
-    js = r"""
-    () => {
-      const out = [];
-      const max = 300;
-      const verifyRe = /(verify|verified|auth|vip|badge|renzheng|认证|v[_-]?type|gold|orange|yellow|jin|cheng|huang|hong|red|金v|橙v|黄v)/i;
-
-      const push = (x) => {
-        if (!x) return;
-        if (out.length >= max) return;
-        out.push(String(x).slice(0, 300));
-      };
-
-      const walk = (node, path, depth) => {
-        if (depth > 7 || out.length >= max) return;
-        if (Array.isArray(node)) {
-          for (let i = 0; i < Math.min(node.length, 50); i++) walk(node[i], `${path}[${i}]`, depth + 1);
-          return;
-        }
-        if (node && typeof node === 'object') {
-          for (const k of Object.keys(node).slice(0, 80)) {
-            const v = node[k];
-            const kp = `${path}.${k}`;
-            if (verifyRe.test(k)) push(`${kp}=${typeof v === 'object' ? '[obj]' : String(v)}`);
-            walk(v, kp, depth + 1);
-          }
-          return;
-        }
-        if (typeof node === 'string' && verifyRe.test(node)) push(`${path}=${node}`);
-      };
-
-      const globals = ['__INITIAL_STATE__', '__NUXT__', '__NEXT_DATA__', '__APOLLO_STATE__', '__PINIA__'];
-      for (const g of globals) {
-        try {
-          if (window[g]) walk(window[g], `window.${g}`, 0);
-        } catch (e) {}
-      }
-
-      const scripts = Array.from(document.querySelectorAll('script[type="application/json"],script'));
-      for (const s of scripts.slice(0, 60)) {
-        const txt = (s.textContent || '').trim();
-        if (!txt) continue;
-        if (!verifyRe.test(txt)) continue;
-        push(`script:${txt.slice(0, 240)}`);
-      }
-      return out;
-    }
-    """
-    try:
-        return page.evaluate(js)
-    except Exception:
-        return []
-
-
-def extract_verify_level(page, api_verify_payloads):
-    svg_probe = _extract_verify_level_from_exact_svg(page)
-    fills = tuple(_normalize_hex_color(x) for x in svg_probe.get("path_fills", []))
-    exact_level = VERIFY_FILL_MAP.get(fills)
-    if exact_level:
-        return exact_level, {
-            "source": "dom_svg_exact",
-            "fills": list(fills),
-            "svg_class": svg_probe.get("svg_class", ""),
-            "svg_html": svg_probe.get("svg_html", ""),
-            "top_lines": svg_probe.get("top_lines", [])[:12],
-        }
-
-    if svg_probe.get("has_profile_card") and svg_probe.get("has_name_row") and not svg_probe.get("has_verify_icon"):
-        if svg_probe.get("has_unverified_hint") or not svg_probe.get("has_verify_text"):
-            return "无认证", {
-                "source": "dom_svg_absent",
-                "verify_text_value": svg_probe.get("verify_text_value", ""),
-                "top_lines": svg_probe.get("top_lines", [])[:12],
-            }
-
-    if svg_probe.get("has_verify_icon"):
-        return "unknown", {
-            "source": "dom_svg_unknown",
-            "fills": list(fills),
-            "svg_class": svg_probe.get("svg_class", ""),
-            "svg_html": svg_probe.get("svg_html", ""),
-            "verify_text_value": svg_probe.get("verify_text_value", ""),
-            "top_lines": svg_probe.get("top_lines", [])[:12],
-        }
-
-    api_level, api_clues = _resolve_verify_level_from_api_payloads(api_verify_payloads)
-    if api_level:
-        return api_level, {
-            "source": "api",
-            "clues": api_clues[:20],
-        }
-
-    return "unknown", {
-        "source": "no_exact_signal",
-        "verify_text_value": svg_probe.get("verify_text_value", ""),
-        "top_lines": svg_probe.get("top_lines", [])[:12],
-    }
-
-
-def _start_verify_response_capture(page):
-    api_payloads = []
-
-    def _on_response(response):
-        try:
-            ctype = (response.headers or {}).get("content-type", "").lower()
-            url_l = response.url.lower()
-            if not any(t in url_l for t in ["weibo", "detail", "account", "user", "profile", "weiq", "api"]):
-                return
-
-            payload = None
-            if "json" in ctype:
-                try:
-                    payload = response.json()
-                except Exception:
-                    payload = None
-            if payload is None:
-                try:
-                    text_payload = response.text()
-                    payload = _extract_json_from_text_payload(text_payload)
-                except Exception:
-                    payload = None
-            if payload is None:
-                return
-
-            clues = _extract_api_verify_clues(payload)
-            if clues:
-                api_payloads.append({"url": response.url, "clues": clues[:120]})
-        except Exception:
-            pass
-
-    page.on("response", _on_response)
-    return api_payloads, _on_response
-
-
-def _stop_verify_response_capture(page, handler):
-    try:
-        page.remove_listener("response", handler)
-    except Exception:
-        pass
-
-def extract_metrics(page):
-    # 【已修正】将“粉丝数量”更正为“粉丝数”
-    target_keys = [
-        "粉丝数", "直发CPM", "阅读中位数", "直发阅读中位数", "转发阅读中位数",
-        "互动中位数", "直发互动中位数", "转发互动中位数", "发布博文数", 
-        "转发中位数", "评论中位数", "点赞中位数", 
-        "最低阅读量", "最高阅读量", "阅读量均值"
-    ]
-    
-    results = {k: "空" for k in target_keys}
-    
+def extract_metrics(page) -> dict[str, str]:
+    results = {k: "空" for k in METRIC_KEYS}
     js_extract_logic = r"""
     (keyword) => {
         const target = keyword.toUpperCase();
         let elements = Array.from(document.querySelectorAll('*'))
             .filter(el => el.childElementCount === 0 && el.textContent.trim().toUpperCase() === target);
-            
+
         if (elements.length === 0) {
             elements = Array.from(document.querySelectorAll('*'))
                 .filter(el => el.childElementCount === 0 && el.textContent.toUpperCase().includes(target));
         }
-        
+
         if (elements.length === 0) return "空_无标签";
-        
+
         const labelEl = elements[0];
-        
+
         let parent = labelEl.parentElement;
         for (let i = 0; i < 4; i++) {
             if (parent) {
                 let textContent = parent.innerText || '';
                 let lines = textContent.split(/[\n\r]+/).map(s => s.trim()).filter(Boolean);
                 let idx = lines.findIndex(s => s.toUpperCase() === target);
-                
+
                 if (idx !== -1 && idx + 1 < lines.length) {
                     let candidate = lines[idx + 1];
                     if (/^[\d,.]+[万wWkK]?$/.test(candidate) || candidate === '-' || candidate.includes('%')) {
@@ -1132,7 +463,7 @@ def extract_metrics(page):
             }
             parent = parent ? parent.parentElement : null;
         }
-        
+
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
         let currentNode = walker.nextNode();
         let found = false;
@@ -1143,7 +474,7 @@ def extract_metrics(page):
             }
             currentNode = walker.nextNode();
         }
-        
+
         if (found) {
             currentNode = walker.nextNode();
             let attempt = 0;
@@ -1159,406 +490,656 @@ def extract_metrics(page):
         return "空_无数据";
     }
     """
-    
-    for key in target_keys:
+
+    for key in METRIC_KEYS:
         try:
             val = page.evaluate(js_extract_logic, key)
             if val:
                 results[key] = val
         except Exception:
-            pass
-            
+            continue
+
     return results
 
-def check_anti_spider(page: Page, *, wait_for_manual: bool = False):
-    needs_manual = False
+
+def detect_auth_or_challenge(page) -> tuple[bool, str]:
     current_url = page.url.lower()
-    
     if "login" in current_url or "passport" in current_url:
-        print("\n\a[风控警告] 当前页面被重定向到了登录页！")
-        needs_manual = True
-        
+        return True, ErrorCode.AUTH_REQUIRED
+
     try:
-        anti_keywords = ["滑动验证", "安全访问验证", "请输入验证码", "访问过于频繁"]
-        page_text = page.locator("body").inner_text(timeout=2000)
-        if any(kw in page_text for kw in anti_keywords):
-            print(f"\n\a[风控警告] 页面命中风控拦截！当前 URL: {page.url}")
-            needs_manual = True
+        page_text = _safe_body_text(page)
+        if any(keyword in page_text for keyword in CAPTCHA_HINT_KEYWORDS):
+            return True, ErrorCode.CAPTCHA_REQUIRED
+        if _page_has_visible_login_form(page) and any(keyword in page_text for keyword in LOGIN_HINT_KEYWORDS):
+            return True, ErrorCode.AUTH_REQUIRED
     except Exception:
         pass
 
-    if needs_manual and wait_for_manual:
-        print(">>>>> 请立即在弹出的浏览器视窗中手动登录或滑块验证 <<<<<")
-        input("请在手动处理完毕（并确保页面已加载出正常数据面板）后，按回车键继续...")
-        print("[恢复] 继续执行爬虫流程。\n")
-        time.sleep(3)
-    return needs_manual
+    return False, ErrorCode.NONE
 
 
-def append_to_excel(row_dict: dict[str, Any], output_excel: str = OUTPUT_EXCEL):
-    df_new = pd.DataFrame([row_dict])
+def infer_blocked_response_issue(page) -> str:
+    needs_auth, reason_code = detect_auth_or_challenge(page)
+    if needs_auth:
+        return reason_code
 
-    _ensure_parent_dir(output_excel)
-    if not os.path.exists(output_excel):
-        df_new.to_excel(output_excel, index=False)
-    else:
-        with pd.ExcelWriter(output_excel, mode="a", engine="openpyxl", if_sheet_exists="overlay") as writer:
-            start_row = writer.sheets["Sheet1"].max_row
-            df_new.to_excel(writer, index=False, header=False, startrow=start_row)
+    page_text = _safe_body_text(page)
+    has_login_form = _page_has_visible_login_form(page)
+    inferred = infer_post_extraction_issue(
+        page_url=page.url,
+        page_text=page_text,
+        has_login_form=has_login_form,
+        extracted_data={key: "空" for key in METRIC_KEYS},
+    )
+    if inferred in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+        return inferred
+    return ErrorCode.HTTP_BLOCKED
+
+
+def perform_lazy_scroll(page) -> None:
+    page.evaluate(
+        """
+        () => {
+            return new Promise((resolve) => {
+                let totalHeight = 0;
+                const distance = 500;
+                const timer = setInterval(() => {
+                    const scrollHeight = document.body.scrollHeight;
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+                    if (totalHeight >= scrollHeight) {
+                        clearInterval(timer);
+                        window.scrollTo(0, 0);
+                        resolve();
+                    }
+                }, 250);
+            });
+        }
+        """
+    )
 
 
 def process_account_url(
-    page: Page,
+    page,
+    context,
     account_id: str,
     url: str,
     current_idx: int,
     total_accounts: int,
-    metrics_enabled: bool = True,
-    *,
-    wait_on_anti_spider: bool = False,
-    hooks: CrawlHooks | None = None,
-):
-    global global_request_count
+    config: CrawlConfig,
+    hooks: CrawlHooks,
+) -> AccountProcessResult:
     progress = f"[{current_idx}/{total_accounts}]"
-    
     print(f"\n{progress} ----------------------------------------------------")
     print(f"{progress} [ID: {account_id}] 正在访问页面...")
-    
-    global_request_count += 1
-    if global_request_count > 1 and global_request_count % 50 == 0:
-        print(f"\n{progress} [机制] 触发防封锁休眠保护！")
-        for remaining in range(180, 0, -1):
-            sys.stdout.write(f"\r{progress} [冷却倒计时] 还需休眠 {remaining:3d} 秒...")
-            sys.stdout.flush()
-            time.sleep(1)
-        print(f"\n{progress} [机制] 冷却结束，恢复执行。\n")
 
-    default_keys = [
-        "粉丝数", "直发CPM", "阅读中位数", "直发阅读中位数", "转发阅读中位数",
-        "互动中位数", "直发互动中位数", "转发互动中位数", "发布博文数", 
-        "转发中位数", "评论中位数", "点赞中位数", 
-        "最低阅读量", "最高阅读量", "阅读量均值"
-    ]
-    extracted_data = {k: "空" for k in default_keys}
-    verify_level = "unknown"
-    verify_debug = {}
-    api_verify_payloads, verify_handler = _start_verify_response_capture(page)
-    
-    try:
-        response = page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        
-        if response is None or response.status >= 400:
-            print(f"{progress} ❌ 页面拦截，状态码: {response.status if response else 'Null'}")
-            return {k: "异常_阻断" for k in default_keys}, verify_level, verify_debug
-            
-        sys.stdout.write(f"\r{progress} 页面抵达，正在执行深度滚动触发懒加载...")
-        sys.stdout.flush()
-        page.evaluate("""
-            () => {
-                return new Promise((resolve) => {
-                    let totalHeight = 0;
-                    let distance = 500;
-                    let timer = setInterval(() => {
-                        let scrollHeight = document.body.scrollHeight;
-                        window.scrollBy(0, distance);
-                        totalHeight += distance;
-                        if(totalHeight >= scrollHeight){
-                            clearInterval(timer);
-                            window.scrollTo(0, 0); 
-                            resolve();
-                        }
-                    }, 250);
-                });
-            }
-        """)
-        print("")
-            
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-            
-        sleep_t2 = random.randint(2, 4)
-        for remaining in range(sleep_t2, 0, -1):
-            sys.stdout.write(f"\r{progress} 数据装配等待中: {remaining} 秒...")
-            sys.stdout.flush()
-            time.sleep(1)
-        print("")
-        
-        blocked = check_anti_spider(page, wait_for_manual=wait_on_anti_spider)
-        if blocked and not wait_on_anti_spider:
-            raise RuntimeError("页面命中登录/风控校验，当前任务不能在无人工干预模式下继续")
-        verify_level, verify_debug = extract_verify_level(page, api_verify_payloads)
-        if verify_level in ("unknown", "无认证"):
-            source = verify_debug.get("source", "unknown")
-            preview = ""
-            if verify_debug.get("icons"):
-                preview = str(verify_debug["icons"][0])[:120]
-            elif verify_debug.get("signals"):
-                preview = str(verify_debug["signals"][0])[:120]
-            elif verify_debug.get("svg_html"):
-                preview = str(verify_debug["svg_html"])[:120]
-            extra = ""
-            if verify_debug.get("verify_text_value"):
-                extra += f" verify_text={str(verify_debug.get('verify_text_value'))[:40]}"
-            if verify_debug.get("fills"):
-                extra += f" fills={verify_debug.get('fills')}"
-            if verify_debug.get("region_debug"):
-                extra += f" region={str(verify_debug.get('region_debug'))[:120]}"
-            print(f"{progress} ⚠️ 认证等级={verify_level}（source={source}）{(' 线索=' + preview) if preview else ''}{extra}")
-        if metrics_enabled:
-            extracted_data = extract_metrics(page)
-        
-        if metrics_enabled:
-            valid_count = sum(1 for v in extracted_data.values() if "空" not in str(v))
-            
-            # 增加无效页面诊断提示
-            if valid_count == 0:
-                print(f"{progress} ⚠️ 页面似乎为空白，博主可能已下架、换号或未被收录。")
-                extracted_data = {k: "账号失效/未收录" for k in default_keys}
-            else:
-                print(f"{progress} ✅ 成功提取 {valid_count} 项核心指标。")
-        else:
-            print(f"{progress} ✅ 认证识别完成：{verify_level}")
-        
-        _emit_hook(
-            hooks,
-            current_account=account_id,
-            message=f"账号 {account_id} 抓取完成",
-        )
-    except PlaywrightTimeoutError:
-        print(f"{progress} ❌ 页面响应超时。")
-        extracted_data = {k: "超时" for k in default_keys}
-        verify_level = "unknown"
-    except Exception as e:
-        print(f"{progress} ❌ 读取报错: {str(e)}")
-        extracted_data = {k: "挂起" for k in default_keys}
-        verify_level = "unknown"
-    finally:
-        _stop_verify_response_capture(page, verify_handler)
-        
-    return extracted_data, verify_level, verify_debug
-
-
-def run_verify_probe(page, probe_uids):
-    if not probe_uids:
-        print("[探针] 未提供有效 uid，跳过认证探针。")
-        return
-
-    print("\n============================================")
-    print("[探针] 开始执行认证等级结构化探针（4样本验收）")
-    print("============================================")
-
-    rows = []
-    total = len(probe_uids)
-    for i, uid in enumerate(probe_uids, 1):
-        probe_id = f"PROBE_UID_{uid}"
-        url = f"https://weiq.com/client/product/weibo/detail?account_uid={uid}"
-        _, level, debug = process_account_url(
-            page,
-            probe_id,
-            url,
-            i,
-            total,
-            metrics_enabled=False,
-        )
-        source = debug.get("source", "unknown")
-        clue_preview = ""
-        if debug.get("clues"):
-            clue_preview = str(debug["clues"][0])[:120]
-        elif debug.get("signals"):
-            clue_preview = str(debug["signals"][0])[:120]
-        rows.append({
-            "uid": uid,
-            "认证等级": level,
-            "证据来源": source,
-            "线索预览": clue_preview or "-",
-        })
-
-    print("\n[探针结果] 认证等级映射预览")
-    print("-" * 95)
-    print(f"{'uid':<14} {'认证等级':<8} {'证据来源':<12} 线索预览")
-    print("-" * 95)
-    for row in rows:
-        print(f"{row['uid']:<14} {row['认证等级']:<8} {row['证据来源']:<12} {row['线索预览']}")
-    print("-" * 95)
-    print("[探针说明] 若结果为 unknown，表示结构化信号不足或冲突，不会回退到颜色识别。")
-
-
-def _records_from_config(config: CrawlConfig) -> list[dict[str, Any]]:
-    if config.accounts is not None:
-        return list(config.accounts)
-    input_excel = config.input_excel or INPUT_EXCEL
-    if not os.path.exists(input_excel):
-        raise ValueError(f"无法定位到输入表: {input_excel}")
-    try:
-        df = pd.read_excel(input_excel)
-    except Exception as exc:
-        raise ValueError(f"Excel 读取失败: {exc}") from exc
-    return df.to_dict(orient="records")
-
-
-def _resolve_output_excel(config: CrawlConfig) -> str:
-    if config.output_excel:
-        return config.output_excel
-    output_dir = config.output_dir or "."
-    return str(Path(output_dir) / OUTPUT_EXCEL)
-
-
-def run_crawl(config: CrawlConfig, hooks: CrawlHooks | None = None) -> CrawlResult:
-    global global_request_count
-    global_request_count = 0
-
-    state_storage = config.state_storage or STATE_JSON
-    output_excel = _resolve_output_excel(config)
-    init_env(output_excel)
-    records = _records_from_config(config)
-    total_accounts = len(records)
-
-    if config.require_login and not has_usable_storage_state(state_storage):
-        if not config.prompt_for_login_if_missing:
-            return CrawlResult(
-                status=TaskStatus.FAILED,
-                output_excel=output_excel,
-                total_accounts=total_accounts,
-                processed_accounts=0,
-                success_accounts=0,
-                failed_accounts=0,
-                skipped_accounts=0,
-                message="缺少可用的登录态 storage_state",
-                error_code=ErrorCode.STORAGE_STATE_INVALID,
+    for attempt in range(1, config.retry_times + 1):
+        if should_stop(hooks):
+            return AccountProcessResult(
+                metrics={k: "取消" for k in METRIC_KEYS},
+                account_status=AccountStatus.CANCELLED,
+                error_code=ErrorCode.CANCELLED,
+                error_message=ERROR_MESSAGES_ZH[ErrorCode.CANCELLED],
             )
 
+        try:
+            response = page.goto(url, timeout=config.goto_timeout_ms, wait_until="domcontentloaded")
+            if response is None or response.status >= 400:
+                msg = f"状态码异常: {response.status if response else 'Null'}"
+                print(f"{progress} ❌ {msg}")
+                issue_code = infer_blocked_response_issue(page)
+                if issue_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+                    auth_handler = hooks.on_auth_required or default_auth_handler
+                    emit_event(
+                        hooks,
+                        {
+                            "type": "auth_required",
+                            "reason_code": issue_code,
+                            "page_url": page.url,
+                            "current_index": current_idx,
+                            "total_accounts": total_accounts,
+                        },
+                    )
+                    if auth_handler(issue_code, page.url, page, context, config.state_storage):
+                        if attempt < config.retry_times:
+                            print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
+                            time.sleep(config.retry_backoff_seconds)
+                            continue
+                    return AccountProcessResult(
+                        metrics={k: "等待登录" for k in METRIC_KEYS},
+                        account_status=AccountStatus.FAILED,
+                        error_code=issue_code,
+                        error_message=ERROR_MESSAGES_ZH[issue_code],
+                    )
+                return AccountProcessResult(
+                    metrics={k: "异常_阻断" for k in METRIC_KEYS},
+                    account_status=AccountStatus.FAILED,
+                    error_code=ErrorCode.HTTP_BLOCKED,
+                    error_message=ERROR_MESSAGES_ZH[ErrorCode.HTTP_BLOCKED],
+                )
+
+            sys.stdout.write(f"\r{progress} 页面抵达，执行滚动加载...")
+            sys.stdout.flush()
+            perform_lazy_scroll(page)
+            print("")
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=config.network_idle_timeout_ms)
+            except Exception:
+                pass
+
+            wait_seconds = random.randint(config.wait_min_seconds, config.wait_max_seconds)
+            for remaining in range(wait_seconds, 0, -1):
+                if should_stop(hooks):
+                    return AccountProcessResult(
+                        metrics={k: "取消" for k in METRIC_KEYS},
+                        account_status=AccountStatus.CANCELLED,
+                        error_code=ErrorCode.CANCELLED,
+                        error_message=ERROR_MESSAGES_ZH[ErrorCode.CANCELLED],
+                    )
+                sys.stdout.write(f"\r{progress} 数据装配等待中: {remaining} 秒...")
+                sys.stdout.flush()
+                time.sleep(1)
+            print("")
+
+            needs_auth, reason_code = detect_auth_or_challenge(page)
+            if needs_auth:
+                auth_handler = hooks.on_auth_required or default_auth_handler
+                emit_event(
+                    hooks,
+                    {
+                        "type": "auth_required",
+                        "reason_code": reason_code,
+                        "page_url": page.url,
+                        "current_index": current_idx,
+                        "total_accounts": total_accounts,
+                    },
+                )
+                if auth_handler(reason_code, page.url, page, context, config.state_storage):
+                    if attempt < config.retry_times:
+                        print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
+                        time.sleep(config.retry_backoff_seconds)
+                        continue
+                return AccountProcessResult(
+                    metrics={k: "等待登录" for k in METRIC_KEYS},
+                    account_status=AccountStatus.FAILED,
+                    error_code=reason_code,
+                    error_message=ERROR_MESSAGES_ZH[reason_code],
+                )
+
+            extracted_data = extract_metrics(page)
+            page_text = _safe_body_text(page)
+            has_login_form = _page_has_visible_login_form(page)
+            issue_code = infer_post_extraction_issue(
+                page_url=page.url,
+                page_text=page_text,
+                has_login_form=has_login_form,
+                extracted_data=extracted_data,
+            )
+            overall_valid_count = _count_effective_metrics(extracted_data, METRIC_KEYS)
+            core_valid_count = _count_effective_metrics(extracted_data, CRITICAL_METRIC_KEYS)
+
+            if issue_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+                auth_handler = hooks.on_auth_required or default_auth_handler
+                emit_event(
+                    hooks,
+                    {
+                        "type": "auth_required",
+                        "reason_code": issue_code,
+                        "page_url": page.url,
+                        "current_index": current_idx,
+                        "total_accounts": total_accounts,
+                    },
+                )
+                if auth_handler(issue_code, page.url, page, context, config.state_storage):
+                    if attempt < config.retry_times:
+                        print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
+                        time.sleep(config.retry_backoff_seconds)
+                        continue
+                return AccountProcessResult(
+                    metrics={k: "等待登录" for k in METRIC_KEYS},
+                    account_status=AccountStatus.FAILED,
+                    error_code=issue_code,
+                    error_message=ERROR_MESSAGES_ZH[issue_code],
+                )
+
+            if issue_code == ErrorCode.EMPTY_PAGE:
+                print(f"{progress} ⚠️ 页面似乎无有效数据。")
+                return AccountProcessResult(
+                    metrics=extracted_data,
+                    account_status=AccountStatus.FAILED,
+                    error_code=ErrorCode.EMPTY_PAGE,
+                    error_message=ERROR_MESSAGES_ZH[ErrorCode.EMPTY_PAGE],
+                )
+
+            print(
+                f"{progress} ✅ 成功提取有效指标：核心 {core_valid_count}/{len(CRITICAL_METRIC_KEYS)}，"
+                f"总计 {overall_valid_count}/{len(METRIC_KEYS)}。"
+            )
+            return AccountProcessResult(
+                metrics=extracted_data,
+                account_status=AccountStatus.SUCCESS,
+                error_code=ErrorCode.NONE,
+                error_message=ERROR_MESSAGES_ZH[ErrorCode.NONE],
+            )
+
+        except PlaywrightTimeoutError:
+            print(f"{progress} ❌ 页面响应超时。")
+            if attempt < config.retry_times:
+                print(f"{progress} [重试] {config.retry_backoff_seconds}s 后进行第 {attempt + 1} 次尝试。")
+                time.sleep(config.retry_backoff_seconds)
+                continue
+            return AccountProcessResult(
+                metrics={k: "超时" for k in METRIC_KEYS},
+                account_status=AccountStatus.FAILED,
+                error_code=ErrorCode.TIMEOUT,
+                error_message=ERROR_MESSAGES_ZH[ErrorCode.TIMEOUT],
+            )
+        except Exception as exc:
+            print(f"{progress} ❌ 读取报错: {exc}")
+            if attempt < config.retry_times:
+                print(f"{progress} [重试] {config.retry_backoff_seconds}s 后进行第 {attempt + 1} 次尝试。")
+                time.sleep(config.retry_backoff_seconds)
+                continue
+            return AccountProcessResult(
+                metrics={k: "挂起" for k in METRIC_KEYS},
+                account_status=AccountStatus.FAILED,
+                error_code=ErrorCode.NAVIGATION_ERROR,
+                error_message=ERROR_MESSAGES_ZH[ErrorCode.NAVIGATION_ERROR],
+            )
+
+    return AccountProcessResult(
+        metrics={k: "挂起" for k in METRIC_KEYS},
+        account_status=AccountStatus.FAILED,
+        error_code=ErrorCode.NAVIGATION_ERROR,
+        error_message=ERROR_MESSAGES_ZH[ErrorCode.NAVIGATION_ERROR],
+    )
+
+
+def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlRunResult:
+    hooks = hooks or CrawlHooks()
+
+    input_excel = str(Path(config.input_excel).resolve())
+    output_excel = resolve_output_path(config.output_dir, config.output_excel)
+    state_store = StateStore(config.state_json or config.state_storage)
+
+    run_id = config.run_id
+    if not run_id:
+        run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S") + "_" + uuid4().hex[:6]
+
+    state_store.ensure_run(run_id)
+
+    started_at = now_iso()
+    emit_event(
+        hooks,
+        {
+            "type": "task_status",
+            "status": TaskStatus.RUNNING,
+            "run_id": run_id,
+            "started_at": started_at,
+            "output_excel": output_excel,
+        },
+    )
+
+    try:
+        df = load_accounts(input_excel)
+    except Exception as exc:
+        finished_at = now_iso()
+        return CrawlRunResult(
+            run_id=run_id,
+            status=TaskStatus.FAILED,
+            total_accounts=0,
+            processed_accounts=0,
+            success_accounts=0,
+            failed_accounts=0,
+            skipped_accounts=0,
+            started_at=started_at,
+            finished_at=finished_at,
+            output_excel=output_excel,
+            error_code=f"INPUT_ERROR: {exc}",
+        )
+
+    total_accounts = len(df)
     processed_accounts = 0
     success_accounts = 0
     failed_accounts = 0
     skipped_accounts = 0
-    _emit_hook(hooks, status=TaskStatus.RUNNING.value, progress=0.0, total_accounts=total_accounts, message="任务开始")
+    terminal_failure_code = ErrorCode.NONE
+    global_request_count = 0
 
-    with sync_playwright() as p:
-        browser, context, page = init_browser(p, headless=config.headless, state_storage=state_storage)
-        try:
-            if config.prompt_for_login_if_missing and not has_usable_storage_state(state_storage):
-                print("\n============================================")
-                page.goto(config.login_url, timeout=60000)
-                print(">>>>> 请在派出的浏览器窗口中完成登录 <<<<<")
-                input("====> 等你【确定登录成功】且进到操作大厅了，再点击终端并在键盘敲【回车键】发车：")
-                _ensure_parent_dir(state_storage)
-                context.storage_state(path=state_storage)
-                print("============================================\n")
+    print(f"[系统] 本次 run_id={run_id}，任务总数 {total_accounts}。")
 
-            if config.probe_verify:
-                run_verify_probe(page, config.probe_uids)
+    original_display = os.environ.get("DISPLAY")
+    if config.display:
+        os.environ["DISPLAY"] = config.display
 
-            for index, row in enumerate(records, start=1):
-                if hooks and hooks.is_cancelled and hooks.is_cancelled():
-                    return CrawlResult(
-                        status=TaskStatus.CANCELLED,
-                        output_excel=output_excel,
+    try:
+        with sync_playwright() as p:
+            browser, context, page = init_browser(p, config.state_storage, config.headless, display=config.display)
+            if not has_usable_storage_state(config.state_storage):
+                print("[初始化] 当前任务没有可用的 WEIQ 临时登录态。")
+                login_url = "https://www.weiq.com/"
+                try:
+                    page.goto(login_url, timeout=config.goto_timeout_ms, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                auth_handler = hooks.on_auth_required or default_auth_handler
+                emit_event(
+                    hooks,
+                    {
+                        "type": "auth_required",
+                        "reason_code": ErrorCode.AUTH_REQUIRED,
+                        "page_url": page.url or login_url,
+                        "current_index": 0,
+                        "total_accounts": total_accounts,
+                    },
+                )
+                if not auth_handler(ErrorCode.AUTH_REQUIRED, page.url or login_url, page, context, config.state_storage):
+                    try:
+                        context.storage_state(path=config.state_storage)
+                    except Exception:
+                        pass
+                    browser.close()
+                    finished_at = now_iso()
+                    emit_event(
+                        hooks,
+                        {
+                            "type": "task_status",
+                            "run_id": run_id,
+                            "status": TaskStatus.BLOCKED_AUTH,
+                            "finished_at": finished_at,
+                            "progress": 0.0,
+                            "error_code": ErrorCode.AUTH_REQUIRED,
+                        },
+                    )
+                    return CrawlRunResult(
+                        run_id=run_id,
+                        status=TaskStatus.BLOCKED_AUTH,
                         total_accounts=total_accounts,
-                        processed_accounts=processed_accounts,
-                        success_accounts=success_accounts,
-                        failed_accounts=failed_accounts,
-                        skipped_accounts=skipped_accounts,
-                        message="任务已取消",
-                        error_code=ErrorCode.CANCELLED,
+                        processed_accounts=0,
+                        success_accounts=0,
+                        failed_accounts=0,
+                        skipped_accounts=0,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        output_excel=output_excel,
+                        error_code=ErrorCode.AUTH_REQUIRED,
                     )
 
-                aid = row.get("账号ID") or row.get("nickname") or row.get("account_id") or row.get("name") or ""
-                uid = row.get("uid")
-                if pd.isna(uid) or str(uid).strip() == "":
-                    print(f"\n[{index}/{total_accounts}] ⚠️ [ID: {aid}] 丢失 uid 链接参数，路过。")
+            for index, row in df.iterrows():
+                current_idx = index + 1
+                aid = str(row.get("账号ID", "未命名账号")).strip()
+                uid_raw = row.get("uid")
+
+                if should_stop(hooks):
+                    print("[系统] 收到取消信号，准备停止任务。")
+                    break
+
+                if pd.isna(uid_raw) or str(uid_raw).strip() == "":
                     skipped_accounts += 1
-                    _emit_hook(
+                    processed_accounts += 1
+                    result_row = {
+                        "run_id": run_id,
+                        "crawl_time": now_iso(),
+                        "account_status": AccountStatus.SKIPPED,
+                        "error_code": ErrorCode.INVALID_UID,
+                        "error_message": ERROR_MESSAGES_ZH[ErrorCode.INVALID_UID],
+                        "账号ID": aid,
+                        "uid": "",
+                        "主页链接": "",
+                    }
+                    result_row.update({k: "空" for k in METRIC_KEYS})
+                    safe_append_row(output_excel, result_row)
+                    emit_event(
                         hooks,
-                        status=TaskStatus.RUNNING.value,
-                        progress=(index / total_accounts) if total_accounts else 1.0,
-                        current_account=str(aid or ""),
-                        processed_accounts=processed_accounts,
-                        success_accounts=success_accounts,
-                        failed_accounts=failed_accounts,
-                        skipped_accounts=skipped_accounts,
-                        total_accounts=total_accounts,
-                        message="账号缺少 uid，已跳过",
+                        {
+                            "type": "progress",
+                            "run_id": run_id,
+                            "status": TaskStatus.RUNNING,
+                            "current_account": aid,
+                            "progress": processed_accounts / total_accounts if total_accounts else 1.0,
+                            "processed": processed_accounts,
+                            "total": total_accounts,
+                            "error_code": ErrorCode.INVALID_UID,
+                        },
                     )
                     continue
 
-                aid = str(aid).strip() or str(uid).strip()
-                uid = str(uid).strip()
-                url = f"https://weiq.com/client/product/weibo/detail?account_uid={uid}"
-                _emit_hook(
-                    hooks,
-                    status=TaskStatus.RUNNING.value,
-                    progress=((index - 1) / total_accounts) if total_accounts else 0.0,
-                    current_account=aid,
-                    processed_accounts=processed_accounts,
-                    success_accounts=success_accounts,
-                    failed_accounts=failed_accounts,
-                    skipped_accounts=skipped_accounts,
-                    total_accounts=total_accounts,
-                    message=f"开始抓取账号 {aid}",
-                )
-                try:
-                    metrics_dict, verify_level, _ = process_account_url(
-                        page,
-                        aid,
-                        url,
-                        index,
-                        total_accounts,
-                        metrics_enabled=True,
-                        wait_on_anti_spider=config.wait_on_anti_spider,
-                        hooks=hooks,
-                    )
-                    result_row = {"账号ID": aid, "uid": uid, "主页链接": url, "认证等级": verify_level}
-                    result_row.update(metrics_dict)
-                    append_to_excel(result_row, output_excel)
-                    success_accounts += 1
-                except Exception as exc:
-                    failed_accounts += 1
-                    print(f"[{index}/{total_accounts}] ❌ 抓取或写入失败: {exc}")
-                    _emit_hook(
-                        hooks,
-                        status=TaskStatus.RUNNING.value,
-                        progress=(index / total_accounts) if total_accounts else 1.0,
-                        current_account=aid,
-                        processed_accounts=processed_accounts,
-                        success_accounts=success_accounts,
-                        failed_accounts=failed_accounts,
-                        skipped_accounts=skipped_accounts,
-                        total_accounts=total_accounts,
-                        message=f"账号 {aid} 失败: {exc}",
-                    )
-                finally:
+                uid = str(uid_raw).strip()
+
+                if config.resume and state_store.is_processed(run_id, uid):
+                    skipped_accounts += 1
                     processed_accounts += 1
+                    print(f"[{current_idx}/{total_accounts}] [ID: {aid}] uid={uid} 已处理，跳过。")
+                    emit_event(
+                        hooks,
+                        {
+                            "type": "progress",
+                            "run_id": run_id,
+                            "status": TaskStatus.RUNNING,
+                            "current_account": aid,
+                            "progress": processed_accounts / total_accounts if total_accounts else 1.0,
+                            "processed": processed_accounts,
+                            "total": total_accounts,
+                            "error_code": ErrorCode.NONE,
+                            "message": f"已跳过 {aid}（{processed_accounts}/{total_accounts}）",
+                        },
+                    )
+                    continue
 
-            if config.save_storage_state:
-                _ensure_parent_dir(state_storage)
-                context.storage_state(path=state_storage)
-        finally:
+                global_request_count += 1
+                if config.cooldown_every > 0 and global_request_count > 1 and global_request_count % config.cooldown_every == 0:
+                    print(f"\n[{current_idx}/{total_accounts}] [机制] 触发冷却保护。")
+                    for remaining in range(config.cooldown_seconds, 0, -1):
+                        if should_stop(hooks):
+                            break
+                        sys.stdout.write(f"\r[{current_idx}/{total_accounts}] 冷却倒计时: {remaining:3d} 秒")
+                        sys.stdout.flush()
+                        time.sleep(1)
+                    print("")
+
+                current_account_label = f"{aid}（UID: {uid}）"
+                emit_event(
+                    hooks,
+                    {
+                        "type": "progress",
+                        "run_id": run_id,
+                        "status": TaskStatus.RUNNING,
+                        "current_account": current_account_label,
+                        "progress": processed_accounts / total_accounts if total_accounts else 1.0,
+                        "processed": processed_accounts,
+                        "total": total_accounts,
+                        "error_code": ErrorCode.NONE,
+                        "message": f"正在抓取 {aid}（第 {current_idx}/{total_accounts} 个）",
+                    },
+                )
+
+                url = f"https://weiq.com/client/product/weibo/detail?account_uid={uid}"
+                process_result = process_account_url(
+                    page=page,
+                    context=context,
+                    account_id=aid,
+                    url=url,
+                    current_idx=current_idx,
+                    total_accounts=total_accounts,
+                    config=config,
+                    hooks=hooks,
+                )
+
+                crawl_time = now_iso()
+                result_row = {
+                    "run_id": run_id,
+                    "crawl_time": crawl_time,
+                    "account_status": process_result.account_status,
+                    "error_code": process_result.error_code,
+                    "error_message": process_result.error_message,
+                    "账号ID": aid,
+                    "uid": uid,
+                    "主页链接": url,
+                }
+                result_row.update(process_result.metrics)
+
+                try:
+                    safe_append_row(output_excel, result_row)
+                    state_store.mark_processed(
+                        run_id=run_id,
+                        uid=uid,
+                        status=process_result.account_status,
+                        error_code=process_result.error_code,
+                    )
+                except Exception as exc:
+                    process_result.account_status = AccountStatus.FAILED
+                    process_result.error_code = ErrorCode.WRITE_ERROR
+                    process_result.error_message = f"{ERROR_MESSAGES_ZH[ErrorCode.WRITE_ERROR]}: {exc}"
+                    failed_accounts += 1
+                    terminal_failure_code = ErrorCode.WRITE_ERROR
+                    processed_accounts += 1
+                    emit_event(
+                        hooks,
+                        {
+                            "type": "progress",
+                            "run_id": run_id,
+                            "status": TaskStatus.RUNNING,
+                            "current_account": current_account_label,
+                            "progress": processed_accounts / total_accounts if total_accounts else 1.0,
+                            "processed": processed_accounts,
+                            "total": total_accounts,
+                            "error_code": ErrorCode.WRITE_ERROR,
+                            "message": f"{aid} 写入结果失败（{processed_accounts}/{total_accounts}）",
+                        },
+                    )
+                    continue
+
+                processed_accounts += 1
+                if process_result.account_status == AccountStatus.SUCCESS:
+                    success_accounts += 1
+                elif process_result.account_status == AccountStatus.CANCELLED:
+                    failed_accounts += 1
+                    terminal_failure_code = ErrorCode.CANCELLED
+                else:
+                    failed_accounts += 1
+                    if process_result.error_code and process_result.error_code != ErrorCode.NONE:
+                        terminal_failure_code = process_result.error_code
+
+                emit_event(
+                    hooks,
+                    {
+                        "type": "progress",
+                        "run_id": run_id,
+                        "status": TaskStatus.RUNNING,
+                        "current_account": current_account_label,
+                        "progress": processed_accounts / total_accounts if total_accounts else 1.0,
+                        "processed": processed_accounts,
+                        "total": total_accounts,
+                        "error_code": process_result.error_code,
+                        "message": f"已完成 {aid}（{processed_accounts}/{total_accounts}）",
+                    },
+                )
+
+                if process_result.error_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+                    terminal_failure_code = process_result.error_code
+                    break
+
+            try:
+                context.storage_state(path=config.state_storage)
+            except Exception:
+                pass
             browser.close()
+    finally:
+        if config.display:
+            if original_display is None:
+                os.environ.pop("DISPLAY", None)
+            else:
+                os.environ["DISPLAY"] = original_display
 
-    message = f"全部任务运行结束，请查看 {output_excel}"
-    print("\n============================================")
-    print(f"[系统] {message}。")
-    print("============================================")
-    _emit_hook(
+    if should_stop(hooks):
+        task_status = TaskStatus.CANCELLED
+        error_code = ErrorCode.CANCELLED
+    elif terminal_failure_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
+        task_status = TaskStatus.BLOCKED_AUTH
+        error_code = terminal_failure_code
+    elif success_accounts > 0:
+        task_status = TaskStatus.SUCCESS
+        error_code = ErrorCode.NONE
+    else:
+        task_status = TaskStatus.FAILED
+        error_code = terminal_failure_code if terminal_failure_code != ErrorCode.NONE else ErrorCode.EMPTY_PAGE
+    finished_at = now_iso()
+    emit_event(
         hooks,
-        status=TaskStatus.SUCCESS.value,
-        progress=1.0,
+        {
+            "type": "task_status",
+            "run_id": run_id,
+            "status": task_status,
+            "finished_at": finished_at,
+            "progress": 1.0 if total_accounts == 0 else processed_accounts / total_accounts,
+            "error_code": error_code,
+        },
+    )
+
+    print("\n============================================")
+    print(f"[系统] 任务结束，状态={task_status}，结果文件: {output_excel}")
+    print("============================================")
+
+    return CrawlRunResult(
+        run_id=run_id,
+        status=task_status,
+        total_accounts=total_accounts,
         processed_accounts=processed_accounts,
         success_accounts=success_accounts,
         failed_accounts=failed_accounts,
         skipped_accounts=skipped_accounts,
-        total_accounts=total_accounts,
-        message=message,
-    )
-    return CrawlResult(
-        status=TaskStatus.SUCCESS,
+        started_at=started_at,
+        finished_at=finished_at,
         output_excel=output_excel,
-        total_accounts=total_accounts,
-        processed_accounts=processed_accounts,
-        success_accounts=success_accounts,
-        failed_accounts=failed_accounts,
-        skipped_accounts=skipped_accounts,
-        message=message,
+        error_code=error_code,
     )
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="WEIQ 采集脚本")
+    parser.add_argument("--input-excel", default=INPUT_EXCEL, help="输入账号表路径")
+    parser.add_argument("--output-excel", default=OUTPUT_EXCEL, help="输出结果文件名或路径")
+    parser.add_argument("--output-dir", default=".", help="输出目录")
+    parser.add_argument("--state-json", default=STATE_JSON, help="登录态文件路径")
+    parser.add_argument("--state-storage", default=STATE_STORE_JSON, help="断点恢复状态存储文件")
+    parser.add_argument("--headless", action="store_true", help="无头模式运行")
+    parser.add_argument("--cooldown-every", type=int, default=50, help="每处理多少账号触发冷却")
+    parser.add_argument("--cooldown-seconds", type=int, default=180, help="冷却秒数")
+    parser.add_argument("--retry-times", type=int, default=1, help="单账号最大重试次数")
+    parser.add_argument("--retry-backoff-seconds", type=int, default=3, help="重试间隔秒数")
+    parser.add_argument("--no-resume", action="store_true", help="禁用断点续跑")
+    parser.add_argument("--run-id", default=None, help="指定 run_id 进行恢复或重跑")
+    parser.add_argument("--display", default=None, help="显式指定 DISPLAY")
+    return parser
+
+
+def parse_cli_config() -> CrawlConfig:
+    args = build_cli_parser().parse_args()
+    return CrawlConfig(
+        input_excel=args.input_excel,
+        output_excel=args.output_excel,
+        state_json=args.state_json,
+        output_dir=args.output_dir,
+        headless=args.headless,
+        cooldown_every=args.cooldown_every,
+        cooldown_seconds=args.cooldown_seconds,
+        retry_times=max(1, args.retry_times),
+        retry_backoff_seconds=max(0, args.retry_backoff_seconds),
+        resume=not args.no_resume,
+        run_id=args.run_id,
+        state_storage=args.state_storage,
+        display=args.display,
+    )
+
+
+def main() -> None:
+    config = parse_cli_config()
+    result = run_crawl(config=config, hooks=CrawlHooks())
+    if result.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

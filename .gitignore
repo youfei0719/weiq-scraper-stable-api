@@ -1,5 +1,6 @@
 # 隐私与凭证文件 (绝对不能上传)
 state.json
+crawl_state.json
 *.pem
 *.key
 *.crt
@@ -25,6 +26,7 @@ __pycache__/
 .runtime/
 .runtime_api/
 runtime/
+runtime_local/
 storage_state.json
 auth_sessions/
 output/
