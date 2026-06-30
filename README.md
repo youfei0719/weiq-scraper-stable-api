@@ -1,11 +1,11 @@
 # WEIQ 数据采集与变化追踪平台
 
-最近更新时间：**2026-04-12 20:58:41 CST (+0800, Asia/Shanghai)**
+最近更新时间：**2026-06-30 19:30:00 CST (+0800, Asia/Shanghai)**
 
 ## 1. 项目简介
 
 WEIQ 项目用于采集账号数据、记录字段变化，并对网站提供标准 API 接口。项目分为两条使用路径：
-- 桌面端（给运营/非技术同学）：图形化操作，支持账号密码或手机号验证码登录，任务可视化，导出可管理。
+- 本地启动器（给运营/非技术同学）：双击启动，自动拉起浏览器、校验登录态、引导登录后继续采集。
 - API 服务（给网站/后端）：任务提交、任务状态查询、账号最新数据与变化记录读取。
 
 核心目标：
@@ -28,18 +28,23 @@ WEIQ 项目用于采集账号数据、记录字段变化，并对网站提供标
   - 当前已验真映射：`#FFF/#F6CA45/#FFF -> 黄V`、`#FFF/#FF6C00/#FFF -> 橙V`、`#FEFF78/#CD3620/#FEFF78 -> 金V`；
   - 明确区分 `无认证` 与 `unknown`，不以截图取色作为主逻辑。
 - 网站接入友好：提供任务与账号数据查询 API，支持轮询集成。
+- 启动统一治理：
+  - `scraper.py` 只保留兼容入口，实际统一走 `scraper_runtime.py`；
+  - 启动后总是先打开 `https://www.weiq.com/` 验证登录态，不再停留 `about:blank`；
+  - 长期 `state.json` 失效时自动进入重登流程，并刷新本次任务的 `storage_state.json`。
 
 ## 3. 目录结构说明
 
 ```text
 .
-├── desktop_app.py            # 桌面端 UI（Streamlit）
-├── scraper.py                # 采集主引擎（CLI + 调度）
+├── scraper.py                # 兼容入口（python scraper.py）
+├── scraper_runtime.py        # 唯一采集运行时（浏览器/登录态/任务执行）
 ├── cloud_api.py              # API 服务（FastAPI）
-├── src/weiq_core/            # 核心契约与通用模块
+├── main.py                   # 结果分析看板（Streamlit）
+├── start_desktop.command     # macOS 双击启动器
+├── start_desktop.bat         # Windows 双击启动器
 ├── tests/                    # 单元测试
-├── inputs/                   # 多账号输入表目录（本地使用，不提交仓库）
-├── data/                     # 中间数据目录
+├── runtime/                  # API/任务运行时目录（不提交仓库）
 ├── weiq_local.db             # 本地 SQLite（本地使用，不提交仓库）
 └── CHANGELOG.md              # 更新日志
 ```
@@ -58,42 +63,39 @@ python -m playwright install chromium --no-shell
 - 如果你使用 `zsh`，`psycopg[binary]` 必须加引号。
 - `--no-shell` 可减少浏览器内核下载失败概率。
 
-### 第 2 步：启动桌面端
+### 第 2 步：启动采集器
 
 - macOS：双击 `start_desktop.command`
 - Windows：双击 `start_desktop.bat`
 - 或命令行：
 
 ```bash
-python -m streamlit run desktop_app.py
+python scraper.py
 ```
+
+启动后程序会自动执行：
+1. 启动浏览器。
+2. 打开 `https://www.weiq.com/`。
+3. 校验长期 `state.json` 是否仍然有效。
+4. 如失效，提示你在浏览器中重新登录。
+5. 登录通过后自动刷新本次任务的 `storage_state.json`，再开始采集。
 
 ### 第 3 步：准备账号输入表
 
-在页面中进入“账号表管理”：
-- 没有模板时先生成模板；
-- 填写账号后上传到 `inputs/` 或直接在页面导入。
+把账号表放在项目目录下，默认文件名为 `accounts.xlsx`。
 
 建议字段：
 - `账号ID`（业务名称）
 - `uid`（唯一标识，必填）
 
-### 第 4 步：配置并启动任务
+### 第 4 步：运行时如何看状态
 
-页面“开始采集”区域按顺序设置：
-1. 选择输入表。
-2. 选择数据库模式（旧库兼容 / 新结构）。
-3. 设置导出目录（可自定义）。
-4. 点击“开始采集任务”。
-
-### 第 5 步：任务运行中如何看状态
-
-你会看到：
-- 状态（中文）
-- 进度条
-- 当前处理账号
-- 最近日志
-- 异常诊断
+终端会直接输出中文状态日志，例如：
+- `正在校验长期登录态`
+- `长期登录态失效，已打开 WEIQ，请完成登录`
+- `登录验证通过，开始采集`
+- `浏览器会话失效，正在自动恢复`
+- `任务结束，状态=SUCCESS`
 
 关键状态说明：
 - `运行中`：正常采集。
@@ -102,15 +104,15 @@ python -m streamlit run desktop_app.py
 - `失败`：任务已终止，查看错误码和日志。
 - `成功`：任务完成，可导出或供 API 读取。
 
-### 第 6 步：登录失效处理（重点）
+### 第 5 步：登录失效处理（重点）
 
-当页面提示登录失效时：
-1. 浏览器窗口会保持打开（不会自动关闭）。
-2. 你在浏览器里完成登录。
-3. 回到桌面端点击“登录后继续（手动）”。
-4. 系统先校验登录态，通过后恢复任务。
+当程序提示登录失效时：
+1. 浏览器窗口会自动保持在 WEIQ 页面，不会停在 `about:blank`。
+2. 你直接在浏览器里完成登录或安全验证。
+3. 回到终端按回车继续。
+4. 系统会再次校验登录态，通过后自动刷新长期 `state.json` 和本次任务 `storage_state.json`。
 
-### 第 7 步：导出与归档
+### 第 6 步：导出与归档
 
 任务完成后：
 - 页面显示本次导出文件路径。
@@ -125,6 +127,12 @@ python -m streamlit run desktop_app.py
 python scraper.py
 ```
 
+或使用统一运行时入口：
+
+```bash
+python -m scraper_runtime
+```
+
 ### 5.2 指定输入表与导出目录
 
 ```bash
@@ -133,40 +141,35 @@ python scraper.py \
   --output-dir /绝对路径/exports
 ```
 
-### 5.3 数据库模式
+### 5.3 显式指定登录态与断点文件
 
 ```bash
-# 旧库兼容模式
-python scraper.py --schema-mode legacy
-
-# 完整新结构模式
-python scraper.py --schema-mode full
-```
-
-### 5.4 周任务调度（示例）
-
-```bash
-python scraper.py --weekly --day-of-week mon --hour 3 --minute 0 --run-immediately
-```
-
-### 5.5 认证等级探针（4样本验收）
-
-```bash
-python scraper.py --probe-verify
+python scraper.py \
+  --state-json /绝对路径/state.json \
+  --state-storage /绝对路径/storage_state.json \
+  --progress-state /绝对路径/crawl_progress.json
 ```
 
 说明：
-- 默认探针样本：`2115314532,6557986019,5099051423,7331622139`
-- 可自定义：
+- `state.json`：长期登录态，程序启动时会先验真它。
+- `storage_state.json`：本次任务临时登录态快照。
+- `crawl_progress.json`：断点续跑进度文件。
+
+### 5.4 无头模式（仅在已验证登录态时建议使用）
 
 ```bash
-python scraper.py --probe-verify --probe-uids 2115314532,6557986019
+python scraper.py --headless
 ```
 
-探针会输出每个 uid 的：
-- `认证等级`（`黄V` / `橙V` / `金V` / `无认证` / `unknown`）
-- `证据来源`（例如 `dom_svg_exact` / `dom_svg_absent` / `dom_svg_unknown` / `api`）
-- `线索预览`（`svg` 片段、`fill` 组合或接口字段片段）
+### 5.5 为什么 `state.json` 会失效
+
+`state.json` 不是永久票据。WEIQ 侧可能因为登录超时、风控、验证码、安全验证等原因让旧登录态失效。
+
+当前版本的处理策略是：
+- 不再因为文件存在就默认视为已登录；
+- 每次启动先真实打开 WEIQ 首页做验真；
+- 失效时自动引导你重登；
+- 重登成功后重新保存长期 `state.json`，再派生本次任务的 `storage_state.json`。
 
 ## 6. API 接入网站详细教程
 
@@ -377,7 +380,7 @@ git grep -n "WEIQ_DB_DSN\|postgresql://\|password\|token\|state.json" || true
 ## 9. 开发与测试
 
 ```bash
-python -m py_compile scraper.py desktop_app.py cloud_api.py src/weiq_core/contracts.py
+python -m py_compile scraper.py scraper_runtime.py cloud_api.py main.py
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 

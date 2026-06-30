@@ -25,4 +25,10 @@ __pycache__/
 # 运行时目录与系统文件
 .runtime/
 .runtime_api/
+runtime/
+runtime_local/
+storage_state.json
+auth_sessions/
+browser_profile/
+output/
 .DS_Store

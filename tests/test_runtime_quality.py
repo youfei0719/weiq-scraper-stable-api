@@ -7,10 +7,14 @@ from scraper_runtime import (
     CRITICAL_METRIC_KEYS,
     ErrorCode,
     METRIC_KEYS,
+    PROFILE_RESULT_KEYS,
     _count_effective_metrics,
+    _resolve_verification_level_from_probe,
     has_usable_storage_state,
+    is_browser_session_closed_error,
     infer_blocked_response_issue,
     infer_post_extraction_issue,
+    select_startup_state_file,
 )
 
 
@@ -20,6 +24,20 @@ class RuntimeQualityTest(unittest.TestCase):
             path = Path(temp_dir) / "state.json"
             path.write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
             self.assertFalse(has_usable_storage_state(str(path)))
+
+    def test_select_startup_state_file_prefers_task_state_then_long_term_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_state = Path(temp_dir) / "storage_state.json"
+            long_term_state = Path(temp_dir) / "state.json"
+            long_term_state.write_text(json.dumps({"cookies": [{"name": "sid"}], "origins": []}), encoding="utf-8")
+            self.assertEqual(select_startup_state_file(str(task_state), str(long_term_state)), str(long_term_state))
+
+            task_state.write_text(json.dumps({"cookies": [{"name": "sid-task"}], "origins": []}), encoding="utf-8")
+            self.assertEqual(select_startup_state_file(str(task_state), str(long_term_state)), str(task_state))
+
+    def test_browser_closed_error_is_marked_recoverable(self) -> None:
+        exc = RuntimeError("Page.goto: Target page, context or browser has been closed")
+        self.assertTrue(is_browser_session_closed_error(exc))
 
     def test_blocked_response_with_login_hints_is_treated_as_auth_required(self) -> None:
         class _LocatorItem:
@@ -80,6 +98,36 @@ class RuntimeQualityTest(unittest.TestCase):
         )
 
         self.assertEqual(issue, ErrorCode.EMPTY_PAGE)
+
+    def test_metric_keys_include_extended_content_fields(self) -> None:
+        for field in ["供稿直发", "供稿转发", "头条文章", "点评", "原创图文", "原创视频"]:
+            self.assertIn(field, METRIC_KEYS)
+        self.assertEqual(PROFILE_RESULT_KEYS, ["认证等级"])
+
+    def test_resolve_verification_level_from_probe_supports_exact_svg_fill_map(self) -> None:
+        level = _resolve_verification_level_from_probe(
+            {
+                "has_profile_card": True,
+                "has_name_row": True,
+                "has_verify_icon": True,
+                "path_fills": ["#FFF", "#F6CA45", "#FFF"],
+                "verify_text_value": "",
+            }
+        )
+        self.assertEqual(level, "黄V")
+
+    def test_resolve_verification_level_from_probe_supports_unverified_hint(self) -> None:
+        level = _resolve_verification_level_from_probe(
+            {
+                "has_profile_card": True,
+                "has_name_row": True,
+                "has_verify_icon": False,
+                "has_verify_text": False,
+                "has_unverified_hint": True,
+                "verify_text_value": "无",
+            }
+        )
+        self.assertEqual(level, "无认证")
 
 
 if __name__ == "__main__":
