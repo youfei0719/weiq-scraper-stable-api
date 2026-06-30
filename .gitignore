@@ -29,5 +29,6 @@ runtime/
 runtime_local/
 storage_state.json
 auth_sessions/
+browser_profile/
 output/
 .DS_Store

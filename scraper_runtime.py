@@ -19,6 +19,7 @@ INPUT_EXCEL = "accounts.xlsx"
 OUTPUT_EXCEL = "weiq_results.xlsx"
 STATE_JSON = "state.json"
 STATE_STORE_JSON = "storage_state.json"
+PROGRESS_STATE_JSON = "crawl_progress.json"
 
 METRIC_KEYS = [
     "粉丝数",
@@ -36,8 +37,21 @@ METRIC_KEYS = [
     "最低阅读量",
     "最高阅读量",
     "阅读量均值",
+    "供稿直发",
+    "供稿转发",
+    "头条文章",
+    "点评",
+    "原创图文",
+    "原创视频",
 ]
 CRITICAL_METRIC_KEYS = ["粉丝数", "直发CPM", "阅读中位数", "发布博文数"]
+PROFILE_RESULT_KEYS = ["认证等级"]
+RESULT_KEYS = [*METRIC_KEYS, *PROFILE_RESULT_KEYS]
+VERIFY_FILL_MAP = {
+    ("#FFFFFF", "#F6CA45", "#FFFFFF"): "黄V",
+    ("#FFFFFF", "#FF6C00", "#FFFFFF"): "橙V",
+    ("#FEFF78", "#CD3620", "#FEFF78"): "金V",
+}
 EMPTY_METRIC_MARKERS = {
     "",
     "-",
@@ -125,6 +139,7 @@ class CrawlConfig:
     input_excel: str = INPUT_EXCEL
     output_excel: str = OUTPUT_EXCEL
     state_json: str = STATE_JSON
+    progress_state: str = PROGRESS_STATE_JSON
     output_dir: str = "."
     display: Optional[str] = None
     headless: bool = True
@@ -240,6 +255,107 @@ def should_stop(hooks: CrawlHooks) -> bool:
 
 def _normalize_metric_text(value: Any) -> str:
     return str(value or "").strip().replace("\u3000", "").replace(" ", "").lower()
+
+
+def _build_result_payload(default_value: str) -> dict[str, str]:
+    return {key: default_value for key in RESULT_KEYS}
+
+
+def _normalize_hex_color(raw: Any) -> str:
+    text = str(raw or "").strip().upper()
+    if not text:
+        return ""
+    if text.startswith("#") and len(text) == 4:
+        return "#" + "".join(ch * 2 for ch in text[1:])
+    return text
+
+
+def _extract_verification_probe(page) -> dict[str, Any]:
+    js = r"""
+    () => {
+      const out = {
+        has_profile_card: false,
+        has_name_row: false,
+        has_verify_icon: false,
+        has_verify_text: false,
+        has_unverified_hint: false,
+        verify_text_value: '',
+        path_fills: [],
+      };
+
+      const all = Array.from(document.querySelectorAll('*'));
+      const card = all.find(el => {
+        const t = (el.innerText || '').trim();
+        return t.includes('UID') && t.includes('粉丝数') && t.includes('博文总数');
+      });
+      if (!card) return out;
+
+      out.has_profile_card = true;
+      const topLines = (card.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean).slice(0, 20);
+      const normalize = (s) => String(s || '').replace(/\s+/g, '');
+      const isNegative = (s) => {
+        const v = normalize(s).toLowerCase();
+        if (!v) return false;
+        if (/^[-—–~～_=·*xX\/]+$/.test(v)) return true;
+        if (['无', '暂无', '未认证', 'none', 'null', 'na', 'n/a'].includes(v)) return true;
+        return false;
+      };
+
+      let verifyTextValue = '';
+      for (const line of topLines) {
+        if (!line.includes('认证信息')) continue;
+        const m = line.match(/认证信息\s*[：:]?\s*(.*)$/);
+        const tail = m ? (m[1] || '') : line.split('认证信息').slice(1).join('');
+        const cleaned = String(tail || '').trim();
+        if (cleaned && !verifyTextValue) verifyTextValue = cleaned;
+      }
+      out.verify_text_value = verifyTextValue;
+      out.has_verify_text = Boolean(verifyTextValue && !isNegative(verifyTextValue));
+      out.has_unverified_hint = Boolean(verifyTextValue) && isNegative(verifyTextValue);
+
+      const nameRow = card.querySelector('.user-name-text.pointer');
+      if (!nameRow) return out;
+
+      out.has_name_row = true;
+      const svg = nameRow.querySelector('svg.gl-icon-default.icon.v.ml4');
+      if (!svg) return out;
+
+      out.has_verify_icon = true;
+      out.path_fills = Array.from(svg.querySelectorAll('path'))
+        .map(p => p.getAttribute('fill') || '')
+        .filter(Boolean);
+      return out;
+    }
+    """
+    probe = page.evaluate(js)
+    return probe if isinstance(probe, dict) else {}
+
+
+def _resolve_verification_level_from_probe(probe: dict[str, Any]) -> str:
+    text_value = str(probe.get("verify_text_value") or "").strip()
+    normalized_text = text_value.replace("认证信息", "").replace("：", ":").replace(":", "").strip()
+    if "金V" in normalized_text:
+        return "金V"
+    if "橙V" in normalized_text:
+        return "橙V"
+    if "黄V" in normalized_text:
+        return "黄V"
+    if probe.get("has_profile_card") and probe.get("has_name_row") and not probe.get("has_verify_icon"):
+        if probe.get("has_unverified_hint") or not probe.get("has_verify_text"):
+            return "无认证"
+
+    fills = tuple(_normalize_hex_color(item) for item in probe.get("path_fills") or [] if _normalize_hex_color(item))
+    if fills in VERIFY_FILL_MAP:
+        return VERIFY_FILL_MAP[fills]
+    return "unknown"
+
+
+def extract_verification_level(page) -> str:
+    try:
+        probe = _extract_verification_probe(page)
+    except Exception:
+        return "unknown"
+    return _resolve_verification_level_from_probe(probe)
 
 
 def _is_empty_metric_value(value: Any) -> bool:
@@ -359,6 +475,70 @@ def has_usable_storage_state(state_file: str) -> bool:
     return bool(cookies or origins)
 
 
+def select_startup_state_file(state_storage: str, state_json: str) -> str | None:
+    for candidate in (state_storage, state_json):
+        if candidate and has_usable_storage_state(candidate):
+            return candidate
+    return None
+
+
+def is_browser_session_closed_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "context has been closed",
+            "page has been closed",
+        )
+    )
+
+
+def _browser_is_alive(browser) -> bool:
+    if browser is None:
+        return False
+    try:
+        return bool(browser.is_connected())
+    except Exception:
+        return False
+
+
+def _context_is_alive(context) -> bool:
+    if context is None:
+        return False
+    try:
+        context.pages
+        return True
+    except Exception:
+        return False
+
+
+def _page_is_alive(page) -> bool:
+    if page is None:
+        return False
+    try:
+        return not page.is_closed()
+    except Exception:
+        return False
+
+
+def persist_login_state(context, *, state_json: str, state_storage: str) -> None:
+    saved = False
+    for path in (state_json, state_storage):
+        target = str(path or "").strip()
+        if not target:
+            continue
+        try:
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=target)
+            saved = True
+        except Exception:
+            continue
+    if not saved:
+        raise RuntimeError("未能保存任何登录态文件")
+
+
 def get_playwright_launch_kwargs(*, headless: bool = True) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"headless": headless}
     server = str(os.getenv("WEIQ_PROXY_SERVER") or "").strip()
@@ -412,14 +592,14 @@ def safe_append_row(path: str, row_dict: dict[str, Any]) -> None:
     to_atomic_excel(str(target), all_df)
 
 
-def init_browser(playwright_obj, state_file: str, headless: bool, *, display: Optional[str] = None):
+def init_browser(playwright_obj, state_file: str | None, headless: bool, *, display: Optional[str] = None) -> dict[str, Any]:
     print("[初始化] 正在启动浏览器...")
     launch_kwargs = get_playwright_launch_kwargs(headless=headless)
     if display:
         launch_kwargs["env"] = {**os.environ, "DISPLAY": display}
     browser = playwright_obj.chromium.launch(**launch_kwargs)
 
-    if os.path.exists(state_file):
+    if state_file and os.path.exists(state_file):
         print(f"[初始化] 检测到凭证文件 {state_file}，尝试恢复会话。")
         context = browser.new_context(storage_state=state_file)
     else:
@@ -427,7 +607,155 @@ def init_browser(playwright_obj, state_file: str, headless: bool, *, display: Op
         context = browser.new_context()
 
     page = context.new_page()
-    return browser, context, page
+    return {"browser": browser, "context": context, "page": page, "state_file": state_file}
+
+
+def close_browser_session(session: dict[str, Any]) -> None:
+    context = session.get("context")
+    browser = session.get("browser")
+    if context is not None:
+        try:
+            context.close()
+        except Exception:
+            pass
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+
+def recreate_browser_session(
+    playwright_obj,
+    session: dict[str, Any],
+    config: CrawlConfig,
+    *,
+    preferred_state_file: str | None = None,
+) -> dict[str, Any]:
+    close_browser_session(session)
+    startup_state_file = preferred_state_file or session.get("state_file")
+    new_session = init_browser(playwright_obj, startup_state_file, config.headless, display=config.display)
+    session.clear()
+    session.update(new_session)
+    return session
+
+
+def ensure_browser_session(
+    playwright_obj,
+    session: dict[str, Any],
+    config: CrawlConfig,
+    *,
+    preferred_state_file: str | None = None,
+) -> dict[str, Any]:
+    if _browser_is_alive(session.get("browser")) and _context_is_alive(session.get("context")) and _page_is_alive(session.get("page")):
+        return session
+    print("[恢复] 浏览器会话失效，正在自动恢复...")
+    return recreate_browser_session(playwright_obj, session, config, preferred_state_file=preferred_state_file)
+
+
+def goto_with_recovery(
+    playwright_obj,
+    session: dict[str, Any],
+    url: str,
+    config: CrawlConfig,
+    *,
+    preferred_state_file: str | None = None,
+    wait_until: str = "domcontentloaded",
+):
+    ensure_browser_session(playwright_obj, session, config, preferred_state_file=preferred_state_file)
+    try:
+        return session["page"].goto(url, timeout=config.goto_timeout_ms, wait_until=wait_until)
+    except Exception as exc:
+        if not is_browser_session_closed_error(exc):
+            raise
+        print("[恢复] 检测到页面句柄已失效，正在重建浏览器页面...")
+        recreate_browser_session(playwright_obj, session, config, preferred_state_file=preferred_state_file)
+        return session["page"].goto(url, timeout=config.goto_timeout_ms, wait_until=wait_until)
+
+
+def verify_homepage_login_state(page) -> tuple[bool, str]:
+    if not _page_is_alive(page):
+        return False, ErrorCode.NAVIGATION_ERROR
+    current_url = str(getattr(page, "url", "") or "").strip().lower()
+    if current_url.startswith("about:blank"):
+        return False, ErrorCode.NAVIGATION_ERROR
+    needs_auth, reason_code = detect_auth_or_challenge(page)
+    if needs_auth:
+        return False, reason_code
+    page_text = _safe_body_text(page)
+    if _page_has_visible_login_form(page) and any(keyword.lower() in page_text.lower() for keyword in LOGIN_HINT_KEYWORDS):
+        return False, ErrorCode.AUTH_REQUIRED
+    return True, ErrorCode.NONE
+
+
+def ensure_authenticated_session(
+    playwright_obj,
+    session: dict[str, Any],
+    config: CrawlConfig,
+    hooks: CrawlHooks,
+    *,
+    total_accounts: int,
+) -> tuple[dict[str, Any], bool]:
+    login_url = "https://www.weiq.com/"
+    auth_handler = hooks.on_auth_required or default_auth_handler
+    startup_state_file = select_startup_state_file(config.state_storage, config.state_json)
+    if startup_state_file != session.get("state_file"):
+        session["state_file"] = startup_state_file
+    print("[初始化] 正在校验长期登录态...")
+    try:
+        goto_with_recovery(
+            playwright_obj,
+            session,
+            login_url,
+            config,
+            preferred_state_file=startup_state_file,
+            wait_until="domcontentloaded",
+        )
+    except Exception:
+        pass
+
+    verified, reason_code = verify_homepage_login_state(session["page"])
+    if verified:
+        persist_login_state(session["context"], state_json=config.state_json, state_storage=config.state_storage)
+        session["state_file"] = config.state_storage
+        print("[初始化] 登录验证通过，开始采集。")
+        return session, True
+
+    print("[初始化] 长期登录态失效，已打开 WEIQ，请完成登录。")
+    emit_event(
+        hooks,
+        {
+            "type": "auth_required",
+            "reason_code": reason_code,
+            "page_url": str(getattr(session["page"], "url", "") or login_url),
+            "current_index": 0,
+            "total_accounts": total_accounts,
+        },
+    )
+    if not auth_handler(reason_code, str(getattr(session["page"], "url", "") or login_url), session["page"], session["context"], config.state_json):
+        return session, False
+
+    try:
+        goto_with_recovery(
+            playwright_obj,
+            session,
+            login_url,
+            config,
+            preferred_state_file=config.state_json,
+            wait_until="domcontentloaded",
+        )
+    except Exception:
+        pass
+
+    verified, reason_code = verify_homepage_login_state(session["page"])
+    if not verified:
+        print(f"[初始化] 登录验证仍未通过，原因={reason_code}。")
+        return session, False
+
+    persist_login_state(session["context"], state_json=config.state_json, state_storage=config.state_storage)
+    session["state_file"] = config.state_storage
+    print("[初始化] 登录验证通过，开始采集。")
+    return session, True
 
 
 def extract_metrics(page) -> dict[str, str]:
@@ -561,8 +889,8 @@ def perform_lazy_scroll(page) -> None:
 
 
 def process_account_url(
-    page,
-    context,
+    playwright_obj,
+    session: dict[str, Any],
     account_id: str,
     url: str,
     current_idx: int,
@@ -575,16 +903,28 @@ def process_account_url(
     print(f"{progress} [ID: {account_id}] 正在访问页面...")
 
     for attempt in range(1, config.retry_times + 1):
+        ensure_browser_session(playwright_obj, session, config, preferred_state_file=session.get("state_file"))
+        page = session["page"]
+        context = session["context"]
         if should_stop(hooks):
             return AccountProcessResult(
-                metrics={k: "取消" for k in METRIC_KEYS},
+                metrics=_build_result_payload("取消"),
                 account_status=AccountStatus.CANCELLED,
                 error_code=ErrorCode.CANCELLED,
                 error_message=ERROR_MESSAGES_ZH[ErrorCode.CANCELLED],
             )
 
         try:
-            response = page.goto(url, timeout=config.goto_timeout_ms, wait_until="domcontentloaded")
+            response = goto_with_recovery(
+                playwright_obj,
+                session,
+                url,
+                config,
+                preferred_state_file=session.get("state_file"),
+                wait_until="domcontentloaded",
+            )
+            page = session["page"]
+            context = session["context"]
             if response is None or response.status >= 400:
                 msg = f"状态码异常: {response.status if response else 'Null'}"
                 print(f"{progress} ❌ {msg}")
@@ -607,13 +947,13 @@ def process_account_url(
                             time.sleep(config.retry_backoff_seconds)
                             continue
                     return AccountProcessResult(
-                        metrics={k: "等待登录" for k in METRIC_KEYS},
+                        metrics=_build_result_payload("等待登录"),
                         account_status=AccountStatus.FAILED,
                         error_code=issue_code,
                         error_message=ERROR_MESSAGES_ZH[issue_code],
                     )
                 return AccountProcessResult(
-                    metrics={k: "异常_阻断" for k in METRIC_KEYS},
+                    metrics=_build_result_payload("异常_阻断"),
                     account_status=AccountStatus.FAILED,
                     error_code=ErrorCode.HTTP_BLOCKED,
                     error_message=ERROR_MESSAGES_ZH[ErrorCode.HTTP_BLOCKED],
@@ -633,7 +973,7 @@ def process_account_url(
             for remaining in range(wait_seconds, 0, -1):
                 if should_stop(hooks):
                     return AccountProcessResult(
-                        metrics={k: "取消" for k in METRIC_KEYS},
+                        metrics=_build_result_payload("取消"),
                         account_status=AccountStatus.CANCELLED,
                         error_code=ErrorCode.CANCELLED,
                         error_message=ERROR_MESSAGES_ZH[ErrorCode.CANCELLED],
@@ -662,13 +1002,14 @@ def process_account_url(
                         time.sleep(config.retry_backoff_seconds)
                         continue
                 return AccountProcessResult(
-                    metrics={k: "等待登录" for k in METRIC_KEYS},
+                    metrics=_build_result_payload("等待登录"),
                     account_status=AccountStatus.FAILED,
                     error_code=reason_code,
                     error_message=ERROR_MESSAGES_ZH[reason_code],
                 )
 
             extracted_data = extract_metrics(page)
+            extracted_data["认证等级"] = extract_verification_level(page)
             page_text = _safe_body_text(page)
             has_login_form = _page_has_visible_login_form(page)
             issue_code = infer_post_extraction_issue(
@@ -698,7 +1039,7 @@ def process_account_url(
                         time.sleep(config.retry_backoff_seconds)
                         continue
                 return AccountProcessResult(
-                    metrics={k: "等待登录" for k in METRIC_KEYS},
+                    metrics=_build_result_payload("等待登录"),
                     account_status=AccountStatus.FAILED,
                     error_code=issue_code,
                     error_message=ERROR_MESSAGES_ZH[issue_code],
@@ -731,26 +1072,34 @@ def process_account_url(
                 time.sleep(config.retry_backoff_seconds)
                 continue
             return AccountProcessResult(
-                metrics={k: "超时" for k in METRIC_KEYS},
+                metrics=_build_result_payload("超时"),
                 account_status=AccountStatus.FAILED,
                 error_code=ErrorCode.TIMEOUT,
                 error_message=ERROR_MESSAGES_ZH[ErrorCode.TIMEOUT],
             )
         except Exception as exc:
             print(f"{progress} ❌ 读取报错: {exc}")
+            if is_browser_session_closed_error(exc):
+                print(f"{progress} [恢复] 浏览器会话失效，正在自动恢复...")
+                recreate_browser_session(
+                    playwright_obj,
+                    session,
+                    config,
+                    preferred_state_file=session.get("state_file"),
+                )
             if attempt < config.retry_times:
                 print(f"{progress} [重试] {config.retry_backoff_seconds}s 后进行第 {attempt + 1} 次尝试。")
                 time.sleep(config.retry_backoff_seconds)
                 continue
             return AccountProcessResult(
-                metrics={k: "挂起" for k in METRIC_KEYS},
+                metrics=_build_result_payload("挂起"),
                 account_status=AccountStatus.FAILED,
                 error_code=ErrorCode.NAVIGATION_ERROR,
                 error_message=ERROR_MESSAGES_ZH[ErrorCode.NAVIGATION_ERROR],
             )
 
     return AccountProcessResult(
-        metrics={k: "挂起" for k in METRIC_KEYS},
+        metrics=_build_result_payload("挂起"),
         account_status=AccountStatus.FAILED,
         error_code=ErrorCode.NAVIGATION_ERROR,
         error_message=ERROR_MESSAGES_ZH[ErrorCode.NAVIGATION_ERROR],
@@ -762,7 +1111,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
 
     input_excel = str(Path(config.input_excel).resolve())
     output_excel = resolve_output_path(config.output_dir, config.output_excel)
-    state_store = StateStore(config.state_json or config.state_storage)
+    state_store = StateStore(config.progress_state)
 
     run_id = config.run_id
     if not run_id:
@@ -816,56 +1165,36 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
 
     try:
         with sync_playwright() as p:
-            browser, context, page = init_browser(p, config.state_storage, config.headless, display=config.display)
-            if not has_usable_storage_state(config.state_storage):
-                print("[初始化] 当前任务没有可用的 WEIQ 临时登录态。")
-                login_url = "https://www.weiq.com/"
-                try:
-                    page.goto(login_url, timeout=config.goto_timeout_ms, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-                auth_handler = hooks.on_auth_required or default_auth_handler
+            startup_state_file = select_startup_state_file(config.state_storage, config.state_json)
+            session = init_browser(p, startup_state_file, config.headless, display=config.display)
+            session, auth_ready = ensure_authenticated_session(p, session, config, hooks, total_accounts=total_accounts)
+            if not auth_ready:
+                close_browser_session(session)
+                finished_at = now_iso()
                 emit_event(
                     hooks,
                     {
-                        "type": "auth_required",
-                        "reason_code": ErrorCode.AUTH_REQUIRED,
-                        "page_url": page.url or login_url,
-                        "current_index": 0,
-                        "total_accounts": total_accounts,
+                        "type": "task_status",
+                        "run_id": run_id,
+                        "status": TaskStatus.BLOCKED_AUTH,
+                        "finished_at": finished_at,
+                        "progress": 0.0,
+                        "error_code": ErrorCode.AUTH_REQUIRED,
                     },
                 )
-                if not auth_handler(ErrorCode.AUTH_REQUIRED, page.url or login_url, page, context, config.state_storage):
-                    try:
-                        context.storage_state(path=config.state_storage)
-                    except Exception:
-                        pass
-                    browser.close()
-                    finished_at = now_iso()
-                    emit_event(
-                        hooks,
-                        {
-                            "type": "task_status",
-                            "run_id": run_id,
-                            "status": TaskStatus.BLOCKED_AUTH,
-                            "finished_at": finished_at,
-                            "progress": 0.0,
-                            "error_code": ErrorCode.AUTH_REQUIRED,
-                        },
-                    )
-                    return CrawlRunResult(
-                        run_id=run_id,
-                        status=TaskStatus.BLOCKED_AUTH,
-                        total_accounts=total_accounts,
-                        processed_accounts=0,
-                        success_accounts=0,
-                        failed_accounts=0,
-                        skipped_accounts=0,
-                        started_at=started_at,
-                        finished_at=finished_at,
-                        output_excel=output_excel,
-                        error_code=ErrorCode.AUTH_REQUIRED,
-                    )
+                return CrawlRunResult(
+                    run_id=run_id,
+                    status=TaskStatus.BLOCKED_AUTH,
+                    total_accounts=total_accounts,
+                    processed_accounts=0,
+                    success_accounts=0,
+                    failed_accounts=0,
+                    skipped_accounts=0,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    output_excel=output_excel,
+                    error_code=ErrorCode.AUTH_REQUIRED,
+                )
 
             for index, row in df.iterrows():
                 current_idx = index + 1
@@ -957,8 +1286,8 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
 
                 url = f"https://weiq.com/client/product/weibo/detail?account_uid={uid}"
                 process_result = process_account_url(
-                    page=page,
-                    context=context,
+                    playwright_obj=p,
+                    session=session,
                     account_id=aid,
                     url=url,
                     current_idx=current_idx,
@@ -1042,10 +1371,10 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                     break
 
             try:
-                context.storage_state(path=config.state_storage)
+                persist_login_state(session["context"], state_json=config.state_json, state_storage=config.state_storage)
             except Exception:
                 pass
-            browser.close()
+            close_browser_session(session)
     finally:
         if config.display:
             if original_display is None:
@@ -1102,8 +1431,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-excel", default=INPUT_EXCEL, help="输入账号表路径")
     parser.add_argument("--output-excel", default=OUTPUT_EXCEL, help="输出结果文件名或路径")
     parser.add_argument("--output-dir", default=".", help="输出目录")
-    parser.add_argument("--state-json", default=STATE_JSON, help="登录态文件路径")
-    parser.add_argument("--state-storage", default=STATE_STORE_JSON, help="断点恢复状态存储文件")
+    parser.add_argument("--state-json", default=STATE_JSON, help="长期登录态文件路径")
+    parser.add_argument("--state-storage", default=STATE_STORE_JSON, help="本次任务临时登录态文件路径")
+    parser.add_argument("--progress-state", default=PROGRESS_STATE_JSON, help="断点续跑进度文件路径")
     parser.add_argument("--headless", action="store_true", help="无头模式运行")
     parser.add_argument("--cooldown-every", type=int, default=50, help="每处理多少账号触发冷却")
     parser.add_argument("--cooldown-seconds", type=int, default=180, help="冷却秒数")
@@ -1121,6 +1451,7 @@ def parse_cli_config() -> CrawlConfig:
         input_excel=args.input_excel,
         output_excel=args.output_excel,
         state_json=args.state_json,
+        progress_state=args.progress_state,
         output_dir=args.output_dir,
         headless=args.headless,
         cooldown_every=args.cooldown_every,

@@ -4,11 +4,26 @@
 
 ## [Unreleased]
 
+### Added（新增）
+- 新增 `start_desktop.command` 与 `start_desktop.bat` 双击启动器，降低本地启动门槛。
+- 新增 `crawl_progress.json` 独立断点续跑文件，避免与登录态文件混用。
+- 新增启动前真实登录态验真流程：程序启动后会先打开 WEIQ 首页并检查是否需要重新登录。
+
 ### Changed（变更）
+- `scraper.py` 收敛为兼容入口，实际采集统一走 `scraper_runtime.py`。
+- CLI 参数语义收敛为：
+  - `state.json` = 长期登录态
+  - `storage_state.json` = 本次任务临时登录态
+  - `crawl_progress.json` = 断点续跑进度文件
 - 微博认证等级识别主逻辑改为读取昵称右侧认证 `svg` 的 `path fill` 组合，不再依赖截图取色或模糊样式猜测。
 - 认证等级判定顺序收敛为：`昵称右侧认证 svg 是否存在` -> `svg 内部 path fill 精确映射` -> `unknown`，不再以视觉颜色估计作为主判断链路。
+- README 启动说明改为与仓库真实入口一致，不再引用已不存在的 `desktop_app.py`。
 
 ### Fixed（修复）
+- 修复“凭证文件存在就默认视为已登录”导致长期 `state.json` 过期后仍直接开跑的问题。
+- 修复浏览器启动后停留在 `about:blank`、未自动打开 WEIQ 首页的问题。
+- 修复 `Page.goto: Target page, context or browser has been closed` 场景下缺少恢复动作的问题，改为优先自动重建浏览器页面并重试一次。
+- 修复断点续跑状态与登录态文件混用的风险，避免采集进度覆盖登录态。
 - 修复认证账号频繁被识别为 `unknown` 的问题。
 - 修复橙V、黄V、金V因颜色近似而互相误判的问题。
 - 修复部分账号被误判为 `无认证` 的问题，改为先判断昵称行认证 `svg` 是否存在。
