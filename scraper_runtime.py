@@ -20,6 +20,12 @@ OUTPUT_EXCEL = "weiq_results.xlsx"
 STATE_JSON = "state.json"
 STATE_STORE_JSON = "storage_state.json"
 PROGRESS_STATE_JSON = "crawl_progress.json"
+WEIQ_STARTUP_URLS = ("https://weiq.com/", "https://www.weiq.com/")
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 
 METRIC_KEYS = [
     "粉丝数",
@@ -79,6 +85,15 @@ LOGIN_HINT_KEYWORDS = [
     "短信验证码",
 ]
 CAPTCHA_HINT_KEYWORDS = ["滑动验证", "安全访问验证", "请输入验证码", "访问过于频繁", "安全验证"]
+BROWSER_ERROR_KEYWORDS = [
+    "无法访问此网站",
+    "响应时间过长",
+    "this site can't be reached",
+    "err_timed_out",
+    "err_connection_timed_out",
+    "err_connection_reset",
+    "err_name_not_resolved",
+]
 LOGIN_FORM_SELECTORS = [
     "input[type='password']",
     "input[placeholder*='密码']",
@@ -495,6 +510,22 @@ def is_browser_session_closed_error(exc: Exception) -> bool:
     )
 
 
+def is_navigation_timeout_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "err_timed_out",
+            "timeout",
+            "timed out",
+            "err_connection_timed_out",
+            "err_name_not_resolved",
+            "err_connection_reset",
+            "err_network_changed",
+        )
+    )
+
+
 def _browser_is_alive(browser) -> bool:
     if browser is None:
         return False
@@ -542,7 +573,10 @@ def persist_login_state(context, *, state_json: str, state_storage: str) -> None
 def get_playwright_launch_kwargs(*, headless: bool = True) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"headless": headless}
     server = str(os.getenv("WEIQ_PROXY_SERVER") or "").strip()
+    use_system_proxy = str(os.getenv("WEIQ_USE_SYSTEM_PROXY") or "").strip().lower() in {"1", "true", "yes", "on"}
     if not server:
+        if not use_system_proxy:
+            kwargs["args"] = ["--proxy-server=direct://", "--proxy-bypass-list=*"]
         return kwargs
     proxy: dict[str, str] = {"server": server}
     for env_name, key in (
@@ -555,6 +589,16 @@ def get_playwright_launch_kwargs(*, headless: bool = True) -> dict[str, Any]:
             proxy[key] = value
     kwargs["proxy"] = proxy
     return kwargs
+
+
+def get_browser_context_kwargs(state_file: str | None) -> dict[str, Any]:
+    context_kwargs: dict[str, Any] = {
+        "user_agent": str(os.getenv("WEIQ_BROWSER_USER_AGENT") or DEFAULT_BROWSER_USER_AGENT).strip()
+        or DEFAULT_BROWSER_USER_AGENT
+    }
+    if state_file and os.path.exists(state_file):
+        context_kwargs["storage_state"] = state_file
+    return context_kwargs
 
 
 def load_accounts(input_excel: str) -> pd.DataFrame:
@@ -599,12 +643,12 @@ def init_browser(playwright_obj, state_file: str | None, headless: bool, *, disp
         launch_kwargs["env"] = {**os.environ, "DISPLAY": display}
     browser = playwright_obj.chromium.launch(**launch_kwargs)
 
-    if state_file and os.path.exists(state_file):
+    context_kwargs = get_browser_context_kwargs(state_file)
+    if "storage_state" in context_kwargs:
         print(f"[初始化] 检测到凭证文件 {state_file}，尝试恢复会话。")
-        context = browser.new_context(storage_state=state_file)
     else:
         print("[警告] 未检测到凭证文件，将以未登录状态启动。")
-        context = browser.new_context()
+    context = browser.new_context(**context_kwargs)
 
     page = context.new_page()
     return {"browser": browser, "context": context, "page": page, "state_file": state_file}
@@ -673,11 +717,55 @@ def goto_with_recovery(
         return session["page"].goto(url, timeout=config.goto_timeout_ms, wait_until=wait_until)
 
 
+def open_weiq_startup_page(
+    playwright_obj,
+    session: dict[str, Any],
+    config: CrawlConfig,
+    *,
+    preferred_state_file: str | None = None,
+) -> tuple[bool, str, str]:
+    last_error_code = ErrorCode.NAVIGATION_ERROR
+    last_url = WEIQ_STARTUP_URLS[0]
+    for login_url in WEIQ_STARTUP_URLS:
+        last_url = login_url
+        try:
+            goto_with_recovery(
+                playwright_obj,
+                session,
+                login_url,
+                config,
+                preferred_state_file=preferred_state_file,
+                wait_until="domcontentloaded",
+            )
+            return True, login_url, ErrorCode.NONE
+        except Exception as exc:
+            if is_navigation_timeout_error(exc):
+                print(f"[初始化] 打开 {login_url} 超时，尝试下一个入口。")
+            else:
+                print(f"[初始化] 打开 {login_url} 失败: {exc}")
+            last_error_code = ErrorCode.NAVIGATION_ERROR
+            continue
+    return False, last_url, last_error_code
+
+
+def is_browser_error_page(page) -> bool:
+    try:
+        current_url = str(getattr(page, "url", "") or "").strip().lower()
+    except Exception:
+        current_url = ""
+    if current_url.startswith("chrome-error://"):
+        return True
+    page_text = _safe_body_text(page).lower()
+    return any(keyword in page_text for keyword in BROWSER_ERROR_KEYWORDS)
+
+
 def verify_homepage_login_state(page) -> tuple[bool, str]:
     if not _page_is_alive(page):
         return False, ErrorCode.NAVIGATION_ERROR
     current_url = str(getattr(page, "url", "") or "").strip().lower()
     if current_url.startswith("about:blank"):
+        return False, ErrorCode.NAVIGATION_ERROR
+    if is_browser_error_page(page):
         return False, ErrorCode.NAVIGATION_ERROR
     needs_auth, reason_code = detect_auth_or_challenge(page)
     if needs_auth:
@@ -695,31 +783,33 @@ def ensure_authenticated_session(
     hooks: CrawlHooks,
     *,
     total_accounts: int,
-) -> tuple[dict[str, Any], bool]:
-    login_url = "https://www.weiq.com/"
+) -> tuple[dict[str, Any], bool, str]:
+    login_url = WEIQ_STARTUP_URLS[0]
     auth_handler = hooks.on_auth_required or default_auth_handler
     startup_state_file = select_startup_state_file(config.state_storage, config.state_json)
     if startup_state_file != session.get("state_file"):
         session["state_file"] = startup_state_file
     print("[初始化] 正在校验长期登录态...")
-    try:
-        goto_with_recovery(
-            playwright_obj,
-            session,
-            login_url,
-            config,
-            preferred_state_file=startup_state_file,
-            wait_until="domcontentloaded",
-        )
-    except Exception:
-        pass
+    opened, login_url, startup_error = open_weiq_startup_page(
+        playwright_obj,
+        session,
+        config,
+        preferred_state_file=startup_state_file,
+    )
+    if not opened:
+        print("[初始化] WEIQ 首页当前不可达，请检查网络或稍后重试。")
+        return session, False, startup_error
 
     verified, reason_code = verify_homepage_login_state(session["page"])
     if verified:
         persist_login_state(session["context"], state_json=config.state_json, state_storage=config.state_storage)
         session["state_file"] = config.state_storage
         print("[初始化] 登录验证通过，开始采集。")
-        return session, True
+        return session, True, ErrorCode.NONE
+
+    if reason_code == ErrorCode.NAVIGATION_ERROR:
+        print("[初始化] WEIQ 首页当前不可达，请检查网络或稍后重试。")
+        return session, False, ErrorCode.NAVIGATION_ERROR
 
     print("[初始化] 长期登录态失效，已打开 WEIQ，请完成登录。")
     emit_event(
@@ -733,29 +823,27 @@ def ensure_authenticated_session(
         },
     )
     if not auth_handler(reason_code, str(getattr(session["page"], "url", "") or login_url), session["page"], session["context"], config.state_json):
-        return session, False
+        return session, False, reason_code
 
-    try:
-        goto_with_recovery(
-            playwright_obj,
-            session,
-            login_url,
-            config,
-            preferred_state_file=config.state_json,
-            wait_until="domcontentloaded",
-        )
-    except Exception:
-        pass
+    opened, login_url, startup_error = open_weiq_startup_page(
+        playwright_obj,
+        session,
+        config,
+        preferred_state_file=config.state_json,
+    )
+    if not opened:
+        print("[初始化] 登录后重新校验 WEIQ 首页失败，请检查网络。")
+        return session, False, startup_error
 
     verified, reason_code = verify_homepage_login_state(session["page"])
     if not verified:
         print(f"[初始化] 登录验证仍未通过，原因={reason_code}。")
-        return session, False
+        return session, False, reason_code
 
     persist_login_state(session["context"], state_json=config.state_json, state_storage=config.state_storage)
     session["state_file"] = config.state_storage
     print("[初始化] 登录验证通过，开始采集。")
-    return session, True
+    return session, True, ErrorCode.NONE
 
 
 def extract_metrics(page) -> dict[str, str]:
@@ -1167,24 +1255,35 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
         with sync_playwright() as p:
             startup_state_file = select_startup_state_file(config.state_storage, config.state_json)
             session = init_browser(p, startup_state_file, config.headless, display=config.display)
-            session, auth_ready = ensure_authenticated_session(p, session, config, hooks, total_accounts=total_accounts)
+            session, auth_ready, startup_error_code = ensure_authenticated_session(
+                p,
+                session,
+                config,
+                hooks,
+                total_accounts=total_accounts,
+            )
             if not auth_ready:
                 close_browser_session(session)
                 finished_at = now_iso()
+                final_status = (
+                    TaskStatus.BLOCKED_AUTH
+                    if startup_error_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}
+                    else TaskStatus.FAILED
+                )
                 emit_event(
                     hooks,
                     {
                         "type": "task_status",
                         "run_id": run_id,
-                        "status": TaskStatus.BLOCKED_AUTH,
+                        "status": final_status,
                         "finished_at": finished_at,
                         "progress": 0.0,
-                        "error_code": ErrorCode.AUTH_REQUIRED,
+                        "error_code": startup_error_code,
                     },
                 )
                 return CrawlRunResult(
                     run_id=run_id,
-                    status=TaskStatus.BLOCKED_AUTH,
+                    status=final_status,
                     total_accounts=total_accounts,
                     processed_accounts=0,
                     success_accounts=0,
@@ -1193,7 +1292,7 @@ def run_crawl(config: CrawlConfig, hooks: Optional[CrawlHooks] = None) -> CrawlR
                     started_at=started_at,
                     finished_at=finished_at,
                     output_excel=output_excel,
-                    error_code=ErrorCode.AUTH_REQUIRED,
+                    error_code=startup_error_code,
                 )
 
             for index, row in df.iterrows():

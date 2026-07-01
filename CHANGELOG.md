@@ -20,6 +20,9 @@
 - README 启动说明改为与仓库真实入口一致，不再引用已不存在的 `desktop_app.py`。
 
 ### Fixed（修复）
+- 修复 macOS 系统代理失效时，Playwright 浏览器继承代理导致 WEIQ 启动预检卡在 `about:blank` 或 `ERR_TIMED_OUT` 的问题；默认改为直连，仅在显式配置 `WEIQ_PROXY_SERVER` 时使用代理。
+- 修复无凭证首次启动时把 WEIQ 网络不可达误判为登录失效的问题，现在会区分 `NAVIGATION_ERROR` 与 `AUTH_REQUIRED`。
+- 修复 WEIQ 对无桌面 UA 的浏览器请求可能拦截的问题，运行时默认使用标准桌面 Chrome UA。
 - 修复“凭证文件存在就默认视为已登录”导致长期 `state.json` 过期后仍直接开跑的问题。
 - 修复浏览器启动后停留在 `about:blank`、未自动打开 WEIQ 首页的问题。
 - 修复 `Page.goto: Target page, context or browser has been closed` 场景下缺少恢复动作的问题，改为优先自动重建浏览器页面并重试一次。

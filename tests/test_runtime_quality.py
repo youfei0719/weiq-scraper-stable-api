@@ -1,20 +1,26 @@
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import unittest
 
 from scraper_runtime import (
+    WEIQ_STARTUP_URLS,
     CRITICAL_METRIC_KEYS,
     ErrorCode,
     METRIC_KEYS,
     PROFILE_RESULT_KEYS,
     _count_effective_metrics,
     _resolve_verification_level_from_probe,
+    get_browser_context_kwargs,
+    get_playwright_launch_kwargs,
     has_usable_storage_state,
+    is_browser_error_page,
     is_browser_session_closed_error,
     infer_blocked_response_issue,
     infer_post_extraction_issue,
     select_startup_state_file,
+    verify_homepage_login_state,
 )
 
 
@@ -38,6 +44,56 @@ class RuntimeQualityTest(unittest.TestCase):
     def test_browser_closed_error_is_marked_recoverable(self) -> None:
         exc = RuntimeError("Page.goto: Target page, context or browser has been closed")
         self.assertTrue(is_browser_session_closed_error(exc))
+
+    def test_browser_error_page_is_detected_as_navigation_error(self) -> None:
+        class _Page:
+            url = "https://www.weiq.com/"
+
+            def is_closed(self) -> bool:
+                return False
+
+            def locator(self, selector: str):  # noqa: ARG002
+                class _Locator:
+                    def inner_text(self, timeout: int = 2000) -> str:  # noqa: ARG002
+                        return "无法访问此网站 www.weiq.com 的响应时间过长。ERR_TIMED_OUT"
+
+                    def count(self) -> int:
+                        return 0
+
+                return _Locator()
+
+        self.assertTrue(is_browser_error_page(_Page()))
+        verified, code = verify_homepage_login_state(_Page())
+        self.assertFalse(verified)
+        self.assertEqual(code, ErrorCode.NAVIGATION_ERROR)
+
+    def test_startup_urls_use_non_www_first(self) -> None:
+        self.assertEqual(WEIQ_STARTUP_URLS[0], "https://weiq.com/")
+
+    def test_default_browser_launch_bypasses_broken_system_proxy(self) -> None:
+        with patch.dict("os.environ", {"WEIQ_PROXY_SERVER": "", "WEIQ_USE_SYSTEM_PROXY": ""}, clear=False):
+            kwargs = get_playwright_launch_kwargs(headless=False)
+
+        self.assertFalse(kwargs["headless"])
+        self.assertIn("--proxy-server=direct://", kwargs["args"])
+        self.assertIn("--proxy-bypass-list=*", kwargs["args"])
+        self.assertNotIn("proxy", kwargs)
+
+    def test_explicit_browser_proxy_still_takes_precedence(self) -> None:
+        with patch.dict("os.environ", {"WEIQ_PROXY_SERVER": "http://127.0.0.1:7897"}, clear=False):
+            kwargs = get_playwright_launch_kwargs(headless=True)
+
+        self.assertTrue(kwargs["headless"])
+        self.assertEqual(kwargs["proxy"]["server"], "http://127.0.0.1:7897")
+        self.assertNotIn("args", kwargs)
+
+    def test_browser_context_uses_desktop_user_agent(self) -> None:
+        with patch.dict("os.environ", {"WEIQ_BROWSER_USER_AGENT": ""}, clear=False):
+            kwargs = get_browser_context_kwargs(None)
+
+        self.assertIn("Mozilla/5.0", kwargs["user_agent"])
+        self.assertIn("Chrome/", kwargs["user_agent"])
+        self.assertNotIn("storage_state", kwargs)
 
     def test_blocked_response_with_login_hints_is_treated_as_auth_required(self) -> None:
         class _LocatorItem:

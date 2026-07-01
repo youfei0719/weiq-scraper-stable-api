@@ -1,6 +1,7 @@
 # 隐私与凭证文件 (绝对不能上传)
 state.json
 crawl_state.json
+crawl_progress.json
 *.pem
 *.key
 *.crt
