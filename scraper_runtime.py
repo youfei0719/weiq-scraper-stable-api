@@ -846,6 +846,61 @@ def ensure_authenticated_session(
     return session, True, ErrorCode.NONE
 
 
+def recover_account_session_after_auth(
+    playwright_obj,
+    session: dict[str, Any],
+    config: CrawlConfig,
+    hooks: CrawlHooks,
+    *,
+    issue_code: str,
+    page_url: str,
+    current_idx: int,
+    total_accounts: int,
+    progress: str,
+) -> tuple[bool, str]:
+    page = session["page"]
+    context = session["context"]
+    auth_handler = hooks.on_auth_required or default_auth_handler
+    emit_event(
+        hooks,
+        {
+            "type": "auth_required",
+            "reason_code": issue_code,
+            "page_url": page_url,
+            "current_index": current_idx,
+            "total_accounts": total_accounts,
+        },
+    )
+    if not auth_handler(issue_code, page_url, page, context, config.state_storage):
+        return False, issue_code
+
+    session["state_file"] = config.state_storage if has_usable_storage_state(config.state_storage) else config.state_json
+    opened, _, startup_error = open_weiq_startup_page(
+        playwright_obj,
+        session,
+        config,
+        preferred_state_file=session.get("state_file"),
+    )
+    if not opened:
+        print(f"{progress} [恢复失败] 登录后无法重新打开 WEIQ 首页。")
+        return False, startup_error
+
+    verified, verify_code = verify_homepage_login_state(session["page"])
+    if not verified:
+        print(f"{progress} [恢复失败] 登录验证未通过，原因={verify_code}。")
+        return False, verify_code
+
+    try:
+        persist_login_state(session["context"], state_json=config.state_json, state_storage=config.state_storage)
+    except Exception:
+        pass
+    session["state_file"] = config.state_storage
+    print(f"{progress} [恢复] 登录验证通过，准备重试当前账号...")
+    if config.retry_backoff_seconds > 0:
+        time.sleep(config.retry_backoff_seconds)
+    return True, ErrorCode.NONE
+
+
 def extract_metrics(page) -> dict[str, str]:
     results = {k: "空" for k in METRIC_KEYS}
     js_extract_logic = r"""
@@ -990,7 +1045,10 @@ def process_account_url(
     print(f"\n{progress} ----------------------------------------------------")
     print(f"{progress} [ID: {account_id}] 正在访问页面...")
 
-    for attempt in range(1, config.retry_times + 1):
+    attempt = 1
+    auth_recovery_count = 0
+    max_auth_recoveries = 3
+    while attempt <= config.retry_times:
         ensure_browser_session(playwright_obj, session, config, preferred_state_file=session.get("state_file"))
         page = session["page"]
         context = session["context"]
@@ -1018,22 +1076,22 @@ def process_account_url(
                 print(f"{progress} ❌ {msg}")
                 issue_code = infer_blocked_response_issue(page)
                 if issue_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
-                    auth_handler = hooks.on_auth_required or default_auth_handler
-                    emit_event(
-                        hooks,
-                        {
-                            "type": "auth_required",
-                            "reason_code": issue_code,
-                            "page_url": page.url,
-                            "current_index": current_idx,
-                            "total_accounts": total_accounts,
-                        },
-                    )
-                    if auth_handler(issue_code, page.url, page, context, config.state_storage):
-                        if attempt < config.retry_times:
-                            print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
-                            time.sleep(config.retry_backoff_seconds)
+                    if auth_recovery_count < max_auth_recoveries:
+                        recovered, recovery_code = recover_account_session_after_auth(
+                            playwright_obj,
+                            session,
+                            config,
+                            hooks,
+                            issue_code=issue_code,
+                            page_url=page.url,
+                            current_idx=current_idx,
+                            total_accounts=total_accounts,
+                            progress=progress,
+                        )
+                        if recovered:
+                            auth_recovery_count += 1
                             continue
+                        issue_code = recovery_code
                     return AccountProcessResult(
                         metrics=_build_result_payload("等待登录"),
                         account_status=AccountStatus.FAILED,
@@ -1073,22 +1131,22 @@ def process_account_url(
 
             needs_auth, reason_code = detect_auth_or_challenge(page)
             if needs_auth:
-                auth_handler = hooks.on_auth_required or default_auth_handler
-                emit_event(
-                    hooks,
-                    {
-                        "type": "auth_required",
-                        "reason_code": reason_code,
-                        "page_url": page.url,
-                        "current_index": current_idx,
-                        "total_accounts": total_accounts,
-                    },
-                )
-                if auth_handler(reason_code, page.url, page, context, config.state_storage):
-                    if attempt < config.retry_times:
-                        print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
-                        time.sleep(config.retry_backoff_seconds)
+                if auth_recovery_count < max_auth_recoveries:
+                    recovered, recovery_code = recover_account_session_after_auth(
+                        playwright_obj,
+                        session,
+                        config,
+                        hooks,
+                        issue_code=reason_code,
+                        page_url=page.url,
+                        current_idx=current_idx,
+                        total_accounts=total_accounts,
+                        progress=progress,
+                    )
+                    if recovered:
+                        auth_recovery_count += 1
                         continue
+                    reason_code = recovery_code
                 return AccountProcessResult(
                     metrics=_build_result_payload("等待登录"),
                     account_status=AccountStatus.FAILED,
@@ -1110,22 +1168,22 @@ def process_account_url(
             core_valid_count = _count_effective_metrics(extracted_data, CRITICAL_METRIC_KEYS)
 
             if issue_code in {ErrorCode.AUTH_REQUIRED, ErrorCode.CAPTCHA_REQUIRED}:
-                auth_handler = hooks.on_auth_required or default_auth_handler
-                emit_event(
-                    hooks,
-                    {
-                        "type": "auth_required",
-                        "reason_code": issue_code,
-                        "page_url": page.url,
-                        "current_index": current_idx,
-                        "total_accounts": total_accounts,
-                    },
-                )
-                if auth_handler(issue_code, page.url, page, context, config.state_storage):
-                    if attempt < config.retry_times:
-                        print(f"{progress} [恢复] 登录处理完成，准备重试当前账号...")
-                        time.sleep(config.retry_backoff_seconds)
+                if auth_recovery_count < max_auth_recoveries:
+                    recovered, recovery_code = recover_account_session_after_auth(
+                        playwright_obj,
+                        session,
+                        config,
+                        hooks,
+                        issue_code=issue_code,
+                        page_url=page.url,
+                        current_idx=current_idx,
+                        total_accounts=total_accounts,
+                        progress=progress,
+                    )
+                    if recovered:
+                        auth_recovery_count += 1
                         continue
+                    issue_code = recovery_code
                 return AccountProcessResult(
                     metrics=_build_result_payload("等待登录"),
                     account_status=AccountStatus.FAILED,
@@ -1158,6 +1216,7 @@ def process_account_url(
             if attempt < config.retry_times:
                 print(f"{progress} [重试] {config.retry_backoff_seconds}s 后进行第 {attempt + 1} 次尝试。")
                 time.sleep(config.retry_backoff_seconds)
+                attempt += 1
                 continue
             return AccountProcessResult(
                 metrics=_build_result_payload("超时"),
@@ -1178,6 +1237,7 @@ def process_account_url(
             if attempt < config.retry_times:
                 print(f"{progress} [重试] {config.retry_backoff_seconds}s 后进行第 {attempt + 1} 次尝试。")
                 time.sleep(config.retry_backoff_seconds)
+                attempt += 1
                 continue
             return AccountProcessResult(
                 metrics=_build_result_payload("挂起"),

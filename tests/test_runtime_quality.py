@@ -5,6 +5,9 @@ from unittest.mock import patch
 import unittest
 
 from scraper_runtime import (
+    AccountStatus,
+    CrawlConfig,
+    CrawlHooks,
     WEIQ_STARTUP_URLS,
     CRITICAL_METRIC_KEYS,
     ErrorCode,
@@ -19,6 +22,7 @@ from scraper_runtime import (
     is_browser_session_closed_error,
     infer_blocked_response_issue,
     infer_post_extraction_issue,
+    process_account_url,
     select_startup_state_file,
     verify_homepage_login_state,
 )
@@ -94,6 +98,61 @@ class RuntimeQualityTest(unittest.TestCase):
         self.assertIn("Mozilla/5.0", kwargs["user_agent"])
         self.assertIn("Chrome/", kwargs["user_agent"])
         self.assertNotIn("storage_state", kwargs)
+
+    def test_auth_recovery_retries_same_account_even_when_retry_times_is_one(self) -> None:
+        class _Response:
+            status = 200
+
+        class _Page:
+            url = "https://weiq.com/client/product/weibo/detail?account_uid=1"
+
+            def wait_for_load_state(self, state: str, timeout: int = 0) -> None:  # noqa: ARG002
+                return None
+
+        session = {"page": _Page(), "context": object(), "state_file": None}
+        config = CrawlConfig(retry_times=1, retry_backoff_seconds=0, wait_min_seconds=0, wait_max_seconds=0)
+        hooks = CrawlHooks()
+        extracted = {key: "空_无标签" for key in METRIC_KEYS}
+        extracted["粉丝数"] = "100万"
+        extracted["直发CPM"] = "12.3"
+        extracted["阅读中位数"] = "3万"
+        extracted["发布博文数"] = "20"
+
+        with patch("scraper_runtime.ensure_browser_session"), patch(
+            "scraper_runtime.goto_with_recovery", side_effect=[_Response(), _Response()]
+        ) as goto_mock, patch("scraper_runtime.perform_lazy_scroll"), patch(
+            "scraper_runtime.detect_auth_or_challenge",
+            side_effect=[(True, ErrorCode.AUTH_REQUIRED), (False, ErrorCode.NONE)],
+        ), patch(
+            "scraper_runtime.recover_account_session_after_auth",
+            return_value=(True, ErrorCode.NONE),
+        ) as recover_mock, patch(
+            "scraper_runtime.extract_metrics", return_value=extracted
+        ), patch(
+            "scraper_runtime.extract_verification_level", return_value="橙V"
+        ), patch(
+            "scraper_runtime._safe_body_text", return_value="账号详情页"
+        ), patch(
+            "scraper_runtime._page_has_visible_login_form", return_value=False
+        ), patch(
+            "scraper_runtime.infer_post_extraction_issue", return_value=ErrorCode.NONE
+        ):
+            result = process_account_url(
+                playwright_obj=object(),
+                session=session,
+                account_id="测试账号",
+                url="https://weiq.com/client/product/weibo/detail?account_uid=1",
+                current_idx=1,
+                total_accounts=1,
+                config=config,
+                hooks=hooks,
+            )
+
+        self.assertEqual(result.account_status, AccountStatus.SUCCESS)
+        self.assertEqual(result.error_code, ErrorCode.NONE)
+        self.assertEqual(result.metrics["认证等级"], "橙V")
+        self.assertEqual(goto_mock.call_count, 2)
+        recover_mock.assert_called_once()
 
     def test_blocked_response_with_login_hints_is_treated_as_auth_required(self) -> None:
         class _LocatorItem:
