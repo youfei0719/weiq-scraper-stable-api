@@ -962,9 +962,34 @@ def _open_content_trend_section(page) -> None:
         time.sleep(0.35)
 
 
-def _collect_post_trend_from_page(page, *, uid: str, limit: int) -> list[dict[str, Any]]:
+def _payload_shape(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 4:
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {str(key)[:80]: _payload_shape(child, depth=depth + 1) for key, child in list(value.items())[:40]}
+    if isinstance(value, list):
+        return [_payload_shape(value[0], depth=depth + 1)] if value else []
+    return type(value).__name__
+
+
+def _collect_post_trend_from_page(page, *, uid: str, limit: int, probe_path: Path | None = None) -> list[dict[str, Any]]:
     payloads: list[Any] = []
-    handler = _capture_json_responses(page, payloads)
+    responses: list[dict[str, Any]] = []
+
+    def handler(response) -> None:
+        try:
+            if "json" not in str(response.headers.get("content-type") or "").lower():
+                return
+            payload = response.json()
+            if not isinstance(payload, (dict, list)):
+                return
+            payloads.append(payload)
+            parsed = urlparse(str(response.url or ""))
+            responses.append({"path": parsed.path, "method": response.request.method, "status": response.status, "content_type": str(response.headers.get("content-type") or "").split(";", 1)[0], "shape": _payload_shape(payload)})
+        except Exception:
+            return
+
+    page.on("response", handler)
     try:
         response = page.goto(f"https://weiq.com/client/product/weibo/detail?account_uid={uid}", timeout=45000, wait_until="domcontentloaded")
         if response is None or response.status >= 400:
@@ -982,6 +1007,9 @@ def _collect_post_trend_from_page(page, *, uid: str, limit: int) -> list[dict[st
         posts = extract_post_trend_from_payloads(payloads, limit=limit)
         if not posts:
             posts = extract_post_trend_from_echarts_options(_extract_echarts_post_payloads(page), limit=limit)
+        if probe_path is not None:
+            probe_path.parent.mkdir(parents=True, exist_ok=True)
+            probe_path.write_text(json.dumps({"uid": uid, "captured_at": now_iso(), "responses": responses, "echarts_candidates": len(_extract_echarts_post_payloads(page)), "result_count": len(posts)}, ensure_ascii=False, indent=2), encoding="utf-8")
         if not posts:
             raise RuntimeError("未识别到最近微博趋势数据，可能是 WEIQ 页面结构已变化")
         return posts
@@ -1027,7 +1055,8 @@ def run_content_trend_batch_task(task_id: str, row: dict[str, Any], *, state_sto
             error = None
             for attempt in range(2):
                 try:
-                    posts = _collect_post_trend_from_page(page, uid=uid, limit=max(1, min(int(batch["content_limit"]), 50)))
+                    probe_path = get_task_runtime_dir(task_id) / "probes" / f"{uid}.json"
+                    posts = _collect_post_trend_from_page(page, uid=uid, limit=max(1, min(int(batch["content_limit"]), 50)), probe_path=probe_path)
                     break
                 except Exception as exc:  # noqa: BLE001
                     error = str(exc)
