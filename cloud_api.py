@@ -1009,7 +1009,11 @@ def _collect_post_trend_from_page(page, *, uid: str, limit: int, probe_path: Pat
             posts = extract_post_trend_from_echarts_options(_extract_echarts_post_payloads(page), limit=limit)
         if probe_path is not None:
             probe_path.parent.mkdir(parents=True, exist_ok=True)
-            probe_path.write_text(json.dumps({"uid": uid, "captured_at": now_iso(), "responses": responses, "echarts_candidates": len(_extract_echarts_post_payloads(page)), "result_count": len(posts)}, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                body_text = " ".join((page.locator("body").inner_text(timeout=1500) or "").split())[:600]
+            except Exception:
+                body_text = ""
+            probe_path.write_text(json.dumps({"uid": uid, "captured_at": now_iso(), "page_url": str(page.url or ""), "page_title": str(page.title() or ""), "body_text": body_text, "responses": responses, "echarts_candidates": len(_extract_echarts_post_payloads(page)), "result_count": len(posts)}, ensure_ascii=False, indent=2), encoding="utf-8")
         if not posts:
             raise RuntimeError("未识别到最近微博趋势数据，可能是 WEIQ 页面结构已变化")
         return posts
