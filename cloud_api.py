@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import queue
+import random
 import re
 import shlex
 import signal
@@ -121,6 +122,12 @@ class CreateTaskRequest(BaseModel):
 
 class CreateContentTrendRequest(BaseModel):
     uid: str = Field(min_length=1, max_length=128)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class CreateContentTrendBatchRequest(BaseModel):
+    import_batch_id: str = Field(min_length=1, max_length=128)
+    uids: list[str] = Field(min_length=1, max_length=500)
     limit: int = Field(default=20, ge=1, le=50)
 
 
@@ -489,6 +496,22 @@ def init_db() -> None:
                     conn.execute(f"ALTER TABLE auth_sessions ADD COLUMN {column_name} {column_def}")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_tasks_login_session_id ON tasks(login_session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_task_id ON auth_sessions(task_id)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS content_trend_batches (
+                  batch_id TEXT PRIMARY KEY, import_batch_id TEXT NOT NULL UNIQUE, root_task_id TEXT NOT NULL UNIQUE,
+                  status TEXT NOT NULL, content_limit INTEGER NOT NULL DEFAULT 20, message TEXT,
+                  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS content_trend_batch_items (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, uid TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending', message TEXT, posts_json TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+                  updated_at TEXT NOT NULL, UNIQUE(batch_id, uid),
+                  FOREIGN KEY(batch_id) REFERENCES content_trend_batches(batch_id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_content_trend_batch_items_batch_status ON content_trend_batch_items(batch_id, status)")
             conn.commit()
         finally:
             conn.close()
@@ -510,6 +533,15 @@ def fetch_one(sql: str, params: tuple[Any, ...] = ()) -> Optional[dict[str, Any]
         try:
             row = conn.execute(sql, params).fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def fetch_all(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
         finally:
             conn.close()
 
@@ -910,6 +942,121 @@ def _extract_echarts_post_payloads(page) -> list[Any]:
         return payloads if isinstance(payloads, list) else []
     except Exception:
         return []
+
+
+def _open_content_trend_section(page) -> None:
+    """WEIQ loads this chart lazily; trigger its visible section before extracting data."""
+    for text_value in ("内容表现", "最近20篇博文趋势", "博文趋势"):
+        try:
+            locator = page.get_by_text(text_value, exact=False).first
+            if locator.is_visible(timeout=800):
+                locator.click(timeout=1500)
+                break
+        except Exception:
+            continue
+    for _ in range(5):
+        try:
+            page.mouse.wheel(0, 900)
+        except Exception:
+            break
+        time.sleep(0.35)
+
+
+def _collect_post_trend_from_page(page, *, uid: str, limit: int) -> list[dict[str, Any]]:
+    payloads: list[Any] = []
+    handler = _capture_json_responses(page, payloads)
+    try:
+        response = page.goto(f"https://weiq.com/client/product/weibo/detail?account_uid={uid}", timeout=45000, wait_until="domcontentloaded")
+        if response is None or response.status >= 400:
+            raise RuntimeError(f"WEIQ 页面访问异常: {response.status if response else 'null'}")
+        _open_content_trend_section(page)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        needs_auth, reason_code = detect_auth_or_challenge(page)
+        if needs_auth:
+            raise RuntimeError(f"AUTH_BLOCKED:{reason_code}")
+        # The page-response parser is scoped to requests after the lazy-load action;
+        # ECharts remains the compatibility fallback when the private response changes.
+        posts = extract_post_trend_from_payloads(payloads, limit=limit)
+        if not posts:
+            posts = extract_post_trend_from_echarts_options(_extract_echarts_post_payloads(page), limit=limit)
+        if not posts:
+            raise RuntimeError("未识别到最近微博趋势数据，可能是 WEIQ 页面结构已变化")
+        return posts
+    finally:
+        try:
+            page.remove_listener("response", handler)
+        except Exception:
+            pass
+
+
+def _content_batch_payload(batch_id: str) -> dict[str, Any]:
+    batch = fetch_one("SELECT * FROM content_trend_batches WHERE batch_id = ?", (batch_id,))
+    if batch is None:
+        raise HTTPException(status_code=404, detail="内容趋势同步批次不存在")
+    items: list[dict[str, Any]] = []
+    for row in fetch_all("SELECT * FROM content_trend_batch_items WHERE batch_id = ? ORDER BY id", (batch_id,)):
+        try:
+            posts = json.loads(str(row.get("posts_json") or "[]"))
+        except Exception:
+            posts = []
+        items.append({"item_id": str(row["id"]), "uid": row["uid"], "status": row["status"], "message": row.get("message"), "posts": posts if isinstance(posts, list) else []})
+    completed = sum(1 for item in items if item["status"] in {"success", "failed", "cancelled"})
+    return {**batch, "processed_accounts": completed, "success_accounts": sum(1 for item in items if item["status"] == "success"), "failed_accounts": sum(1 for item in items if item["status"] in {"failed", "cancelled"}), "items": items}
+
+
+def run_content_trend_batch_task(task_id: str, row: dict[str, Any], *, state_storage: str, display: str | None) -> None:
+    batch_id = str(row.get("target_uid") or "").strip()
+    batch = fetch_one("SELECT * FROM content_trend_batches WHERE batch_id = ?", (batch_id,))
+    if not batch:
+        raise RuntimeError("内容趋势同步批次不存在")
+    playwright_ctx = browser = context = page = None
+    try:
+        execute("UPDATE content_trend_batches SET status = ?, started_at = ?, message = ? WHERE batch_id = ?", ("running", now_iso(), "正在串行采集账号微博趋势", batch_id))
+        playwright_ctx = sync_playwright().start()
+        browser, context, page = init_browser(playwright_ctx, state_storage, bool(row.get("headless")), display=display)
+        pending = fetch_all("SELECT * FROM content_trend_batch_items WHERE batch_id = ? AND status IN ('pending', 'running') ORDER BY id", (batch_id,))
+        total = len(fetch_all("SELECT id FROM content_trend_batch_items WHERE batch_id = ?", (batch_id,)))
+        for index, item in enumerate(pending, start=1):
+            uid = str(item["uid"])
+            upsert_task_event(task_id, {"current_account": f"UID: {uid}", "processed_accounts": index - 1, "total_accounts": total, "progress": (index - 1) / max(1, total), "message": "正在读取最近微博内容趋势"})
+            execute("UPDATE content_trend_batch_items SET status = ?, message = ?, updated_at = ? WHERE id = ?", ("running", None, now_iso(), item["id"]))
+            posts = None
+            error = None
+            for attempt in range(2):
+                try:
+                    posts = _collect_post_trend_from_page(page, uid=uid, limit=max(1, min(int(batch["content_limit"]), 50)))
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                    if error.startswith("AUTH_BLOCKED:"):
+                        reason = error.split(":", 1)[1]
+                        execute("UPDATE content_trend_batches SET status = ?, message = ? WHERE batch_id = ?", ("blocked_auth", "WEIQ 登录态失效或触发风控，批次已暂停", batch_id))
+                        _set_task_blocked_auth(task_id, reason_code=reason, page=page, context=context)
+                        return
+                    if attempt == 0:
+                        time.sleep(random.uniform(1.0, 2.0))
+            if posts:
+                execute("UPDATE content_trend_batch_items SET status = 'success', posts_json = ?, message = NULL, retry_count = ?, updated_at = ? WHERE id = ?", (json.dumps(posts, ensure_ascii=False), attempt, now_iso(), item["id"]))
+            else:
+                execute("UPDATE content_trend_batch_items SET status = 'failed', message = ?, retry_count = 1, updated_at = ? WHERE id = ?", (error or "内容趋势采集失败", now_iso(), item["id"]))
+            time.sleep(random.uniform(0.7, 1.5))
+        summary = _content_batch_payload(batch_id)
+        final_status = "success" if summary["failed_accounts"] == 0 else "partial" if summary["success_accounts"] else "failed"
+        execute("UPDATE content_trend_batches SET status = ?, finished_at = ?, message = ? WHERE batch_id = ?", (final_status, now_iso(), "批次采集完成", batch_id))
+        upsert_task_event(task_id, {"status": TaskStatus.SUCCESS, "progress": 1.0, "processed_accounts": total, "total_accounts": total, "success_accounts": summary["success_accounts"], "failed_accounts": summary["failed_accounts"], "finished_at": now_iso(), "message": "微博内容趋势批次已完成", "error_code": ErrorCode.NONE})
+    except Exception as exc:
+        execute("UPDATE content_trend_batches SET status = ?, finished_at = ?, message = ? WHERE batch_id = ?", ("failed", now_iso(), str(exc), batch_id))
+        upsert_task_event(task_id, {"status": TaskStatus.FAILED, "finished_at": now_iso(), "error_code": "CONTENT_TREND_BATCH_FAILED", "message": str(exc)})
+    finally:
+        for resource, method in ((context, "close"), (browser, "close"), (playwright_ctx, "stop")):
+            if resource is not None:
+                try:
+                    getattr(resource, method)()
+                except Exception:
+                    pass
 
 
 def run_content_trend_task(task_id: str, row: dict[str, Any], *, state_storage: str, display: str | None) -> None:
@@ -2365,6 +2512,14 @@ def run_task(task_id: str) -> None:
             finalize_task_auth_session(task_id, latest["status"])
         return
 
+    if str(row.get("task_type") or "metrics") == "content_trend_batch":
+        upsert_task_event(task_id, {"status": TaskStatus.RUNNING, "started_at": now_iso(), "picked_up_at": now_iso(), "message": "WEIQ 执行器已接单，开始串行采集微博内容趋势", "current_url": None, "page_title": None, "screenshot_path": None, "resolution": None, "can_resume": 0})
+        run_content_trend_batch_task(task_id, row, state_storage=auth_state_storage, display=display)
+        latest = fetch_one("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
+        if latest and latest["status"] in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            finalize_task_auth_session(task_id, latest["status"])
+        return
+
     config = CrawlConfig(
         input_excel=row["input_excel"],
         output_excel=row["output_excel"],
@@ -2738,6 +2893,56 @@ def get_content_trend_task(task_id: str) -> dict[str, Any]:
         posts = []
     payload["posts"] = posts if isinstance(posts, list) else []
     return payload
+
+
+@app.post("/v1/content-trend-batches")
+def create_content_trend_batch(payload: CreateContentTrendBatchRequest) -> dict[str, Any]:
+    if get_auth_mode() == "browser_worker":
+        auth_payload = _browser_worker_status_payload()
+        if not auth_payload["authenticated"]:
+            return {"batch_id": None, "status": "AUTH_REQUIRED", "message": auth_payload["message"] or "需要先登录 WEIQ", "items": []}
+    import_batch_id = payload.import_batch_id.strip()
+    existing = fetch_one("SELECT batch_id FROM content_trend_batches WHERE import_batch_id = ?", (import_batch_id,))
+    if existing:
+        return _content_batch_payload(str(existing["batch_id"]))
+    uids = list(dict.fromkeys(str(uid or "").strip() for uid in payload.uids if str(uid or "").strip()))
+    if not uids:
+        raise HTTPException(status_code=400, detail="uids 不能为空")
+    batch_id, task_id, created_at = uuid4().hex, uuid4().hex, now_iso()
+    runtime_dir = get_task_runtime_dir(task_id)
+    state_storage = str(get_legacy_state_json_path()) if get_auth_mode() == "browser_worker" else str(runtime_dir / "task_auth_placeholder.json")
+    execute("""
+        INSERT INTO tasks (task_id, status, progress, current_account, blocked_reason, error_code, message,
+          input_excel, output_excel, output_dir, state_json, state_storage, headless, cooldown_every,
+          cooldown_seconds, retry_times, retry_backoff_seconds, resume, login_session_id, accepted_at,
+          picked_up_at, created_at, task_type, target_uid, content_limit, content_json)
+        VALUES (?, ?, 0, NULL, NULL, ?, ?, '', '', ?, ?, ?, ?, 0, 0, 1, 0, 1, NULL, ?, NULL, ?, ?, ?, ?, NULL)
+    """, (task_id, TaskStatus.PENDING, ErrorCode.NONE, "微博内容趋势批次已受理，等待执行器接单", str(runtime_dir.resolve()), str((runtime_dir / "content_trend_batch_progress.json").resolve()), state_storage, int(get_browser_headless()) if get_auth_mode() == "browser_worker" else 1, created_at, created_at, "content_trend_batch", batch_id, payload.limit))
+    execute("INSERT INTO content_trend_batches (batch_id, import_batch_id, root_task_id, status, content_limit, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (batch_id, import_batch_id, task_id, "pending", payload.limit, "批次已入队", created_at))
+    for uid in uids:
+        execute("INSERT INTO content_trend_batch_items (batch_id, uid, status, updated_at) VALUES (?, ?, 'pending', ?)", (batch_id, uid, created_at))
+    enqueue_task(task_id)
+    return _content_batch_payload(batch_id)
+
+
+@app.get("/v1/content-trend-batches/{batch_id}")
+def get_content_trend_batch(batch_id: str) -> dict[str, Any]:
+    return _content_batch_payload(batch_id)
+
+
+@app.post("/v1/content-trend-batches/{batch_id}/retry-failed")
+def retry_failed_content_trend_batch_items(batch_id: str) -> dict[str, Any]:
+    batch = fetch_one("SELECT * FROM content_trend_batches WHERE batch_id = ?", (batch_id,))
+    if batch is None:
+        raise HTTPException(status_code=404, detail="内容趋势同步批次不存在")
+    failed = fetch_all("SELECT id FROM content_trend_batch_items WHERE batch_id = ? AND status IN ('failed', 'cancelled')", (batch_id,))
+    if not failed:
+        raise HTTPException(status_code=409, detail="该批次没有可重试的失败账号")
+    execute("UPDATE content_trend_batch_items SET status = 'pending', message = NULL, updated_at = ? WHERE batch_id = ? AND status IN ('failed', 'cancelled')", (now_iso(), batch_id))
+    execute("UPDATE content_trend_batches SET status = 'pending', finished_at = NULL, message = ? WHERE batch_id = ?", ("正在重试失败账号", batch_id))
+    execute("UPDATE tasks SET status = ?, finished_at = NULL, error_code = ?, message = ? WHERE task_id = ?", (TaskStatus.PENDING, ErrorCode.NONE, "正在重试内容趋势批次失败账号", batch["root_task_id"]))
+    enqueue_task(str(batch["root_task_id"]))
+    return _content_batch_payload(batch_id)
 
 
 @app.get("/v1/tasks/{task_id}")
