@@ -4,6 +4,8 @@ from pathlib import Path
 from unittest.mock import patch
 import unittest
 
+import pandas as pd
+
 from scraper_runtime import (
     AccountStatus,
     CrawlConfig,
@@ -14,7 +16,9 @@ from scraper_runtime import (
     METRIC_KEYS,
     PROFILE_RESULT_KEYS,
     _count_effective_metrics,
+    _post_trend_row_from_item,
     _resolve_verification_level_from_probe,
+    extract_post_trend_rows,
     get_browser_context_kwargs,
     get_playwright_launch_kwargs,
     has_usable_storage_state,
@@ -24,6 +28,7 @@ from scraper_runtime import (
     infer_post_extraction_issue,
     process_account_url,
     select_startup_state_file,
+    to_atomic_excel,
     verify_homepage_login_state,
 )
 
@@ -185,6 +190,13 @@ class RuntimeQualityTest(unittest.TestCase):
 
         self.assertEqual(_count_effective_metrics(extracted, CRITICAL_METRIC_KEYS), 2)
 
+    def test_effective_metric_count_treats_zero_as_valid_returned_data(self) -> None:
+        extracted = {key: "空_无标签" for key in METRIC_KEYS}
+        extracted["转发阅读中位数"] = "0"
+        extracted["评论中位数"] = "0"
+
+        self.assertEqual(_count_effective_metrics(extracted, METRIC_KEYS), 2)
+
     def test_soft_login_wall_is_treated_as_auth_required(self) -> None:
         extracted = {key: "空_无标签" for key in METRIC_KEYS}
         extracted["粉丝数"] = "126w"
@@ -243,6 +255,84 @@ class RuntimeQualityTest(unittest.TestCase):
             }
         )
         self.assertEqual(level, "无认证")
+
+    def test_post_trend_contract_extracts_rows_and_preserves_source_order(self) -> None:
+        payload = {
+            "data": {
+                "reads": {
+                    "list": [
+                        {"id": "post-1", "time": "2026-08-20 12:00", "value": "99,362", "text": " 第一篇\n微博 ", "pic": "https://image.example/1.jpg"},
+                        {"id": "post-2", "time": "2026-08-19 12:00", "value": 18, "text": "第二篇"},
+                    ]
+                }
+            }
+        }
+        rows, status, error = extract_post_trend_rows(
+            [payload], uid="5823997358", account_id="APP帝", run_id="run-1", crawl_time="2026-08-26T00:00:00"
+        )
+        self.assertEqual((status, error), ("success", None))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["source_post_id"], "post-1")
+        self.assertEqual(rows[0]["阅读量"], 99362)
+        self.assertEqual(rows[0]["正文摘要"], "第一篇 微博")
+        self.assertEqual(rows[0]["封面URL"], "https://image.example/1.jpg")
+        self.assertEqual([row["source_order"] for row in rows], [0, 1])
+
+    def test_post_trend_fallback_id_and_http_link_are_supported(self) -> None:
+        row = _post_trend_row_from_item(
+            {"time": "2026-08-20", "value": 42, "text": "无 ID", "name": "https://weibo.com/123/post"},
+            uid="uid-1", account_id="账号", run_id="run", crawl_time="now", order=0,
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertTrue(row["source_post_id"].startswith("fallback-"))
+        self.assertEqual(row["微博链接"], "https://weibo.com/123/post")
+        self.assertIsNone(row["封面URL"])
+
+    def test_post_trend_type_is_conservative(self) -> None:
+        direct = _post_trend_row_from_item(
+            {"id": "d", "time": "2026-08-20", "value": 1, "text": "原发", "is_original": True},
+            uid="u", account_id="a", run_id="r", crawl_time="now", order=0,
+        )
+        repost = _post_trend_row_from_item(
+            {"id": "r", "time": "2026-08-20", "value": 1, "text": "转发", "is_repost": True},
+            uid="u", account_id="a", run_id="r", crawl_time="now", order=1,
+        )
+        unknown = _post_trend_row_from_item(
+            {"id": "x", "time": "2026-08-20", "value": 1, "text": "未知"},
+            uid="u", account_id="a", run_id="r", crawl_time="now", order=2,
+        )
+        self.assertEqual(direct["博文类型"], "direct")
+        self.assertEqual(repost["博文类型"], "repost")
+        self.assertEqual(unknown["博文类型"], "unknown")
+
+    def test_post_trend_contract_change_and_empty_list_are_reported(self) -> None:
+        changed_rows, changed_status, changed_error = extract_post_trend_rows(
+            [{"data": {"reads": {"items": []}}}], uid="u", account_id="a", run_id="r", crawl_time="now"
+        )
+        self.assertEqual(changed_rows, [])
+        self.assertEqual(changed_status, "failed")
+        self.assertIsNotNone(changed_error)
+
+        empty_rows, empty_status, empty_error = extract_post_trend_rows(
+            [{"data": {"reads": {"list": []}}}], uid="u", account_id="a", run_id="r", crawl_time="now"
+        )
+        self.assertEqual(empty_rows, [])
+        self.assertEqual(empty_status, "empty")
+        self.assertIsNotNone(empty_error)
+
+    def test_excel_output_contains_weekly_and_post_trend_sheets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "result.xlsx"
+            to_atomic_excel(
+                str(output),
+                pd.DataFrame([{"uid": "u-1", "账号ID": "账号"}]),
+                pd.DataFrame([{"uid": "u-1", "source_post_id": "post-1", "发布时间": "2026-08-20", "阅读量": 8}]),
+            )
+            with pd.ExcelFile(output) as workbook:
+                self.assertEqual(workbook.sheet_names, ["账号周指标", "微博趋势"])
+            trends = pd.read_excel(output, sheet_name="微博趋势")
+            self.assertEqual(trends.loc[0, "source_post_id"], "post-1")
 
 
 if __name__ == "__main__":
