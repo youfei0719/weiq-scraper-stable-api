@@ -11,4 +11,4 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-exec "$PYTHON_BIN" scraper.py
+exec "$PYTHON_BIN" -m scraper_runtime

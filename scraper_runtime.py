@@ -54,6 +54,12 @@ METRIC_KEYS = [
 CRITICAL_METRIC_KEYS = ["粉丝数", "直发CPM", "阅读中位数", "发布博文数"]
 PROFILE_RESULT_KEYS = ["认证等级"]
 RESULT_KEYS = [*METRIC_KEYS, *PROFILE_RESULT_KEYS]
+POST_READ_ALIASES = ("阅读量", "阅读全文", "阅读", "read_count", "readCount", "read_num", "readNum", "reads")
+POST_TIME_ALIASES = ("发布时间", "publish_time", "publishTime", "created_at", "createdAt", "date", "time")
+POST_TEXT_ALIASES = ("正文", "内容", "博文内容", "微博内容", "text", "content", "desc", "title")
+POST_COVER_ALIASES = ("封面", "封面图", "图片", "cover", "cover_url", "coverUrl", "image", "image_url", "imageUrl", "pic")
+POST_URL_ALIASES = ("微博链接", "博文链接", "url", "weibo_url", "weiboUrl", "post_url", "postUrl", "link")
+POST_ID_ALIASES = ("微博ID", "博文ID", "mid", "mblogid", "mblog_id", "post_id", "postId", "id")
 VERIFY_FILL_MAP = {
     ("#FFFFFF", "#F6CA45", "#FFFFFF"): "黄V",
     ("#FFFFFF", "#FF6C00", "#FFFFFF"): "橙V",
@@ -409,6 +415,141 @@ def _parse_metric_number(value: Any) -> float:
         return float(text) * multiplier
     except ValueError:
         return 0.0
+
+
+def _post_value(item: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    normalized = {str(key).strip().lower(): value for key, value in item.items()}
+    for alias in aliases:
+        value = normalized.get(alias.lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _normalize_post_text(value: Any, limit: int = 500) -> str:
+    return " ".join(str(value or "").split()).strip()[:limit]
+
+
+def _normalize_legacy_post_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    reads = _parse_metric_number(_post_value(item, POST_READ_ALIASES))
+    published_at = _normalize_post_text(_post_value(item, POST_TIME_ALIASES), 64)
+    content = _normalize_post_text(_post_value(item, POST_TEXT_ALIASES))
+    cover_url = _normalize_post_text(_post_value(item, POST_COVER_ALIASES), 1024)
+    post_url = _normalize_post_text(_post_value(item, POST_URL_ALIASES), 1024)
+    source_post_id = _normalize_post_text(_post_value(item, POST_ID_ALIASES), 128)
+    if reads <= 0 or not published_at:
+        return None
+    if not source_post_id:
+        fingerprint = f"{published_at}|{content}|{int(reads)}"
+        source_post_id = f"hash:{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:24]}"
+    return {
+        "source_post_id": source_post_id,
+        "published_at": published_at,
+        "reads": int(round(reads)),
+        "content": content,
+        "cover_url": cover_url or None,
+        "post_url": post_url or None,
+    }
+
+
+def extract_post_trend_from_payloads(payloads: list[Any], limit: int = 20) -> list[dict[str, Any]]:
+    """Compatibility parser for the API's legacy trend response contract."""
+    candidates: list[list[dict[str, Any]]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            posts = [
+                post
+                for post in (_normalize_legacy_post_item(item) for item in value if isinstance(item, dict))
+                if post
+            ]
+            if posts:
+                candidates.append(posts)
+            for child in value:
+                walk(child)
+
+    for payload in payloads:
+        walk(payload)
+    if not candidates:
+        return []
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    best = max(candidates, key=lambda items: (len(items), sum(bool(item["content"]) for item in items)))
+    for item in best:
+        if item["source_post_id"] in seen:
+            continue
+        seen.add(item["source_post_id"])
+        deduped.append(item)
+        if len(deduped) >= max(1, min(limit, 50)):
+            break
+    return deduped
+
+
+def extract_post_trend_from_echarts_options(options: list[Any], limit: int = 20) -> list[dict[str, Any]]:
+    """Compatibility fallback used by the API when WEIQ omits its post payload."""
+
+    def walk(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            axes = value.get("xAxis")
+            axes = axes if isinstance(axes, list) else [axes]
+            labels = next(
+                (axis.get("data") for axis in axes if isinstance(axis, dict) and isinstance(axis.get("data"), list)),
+                [],
+            )
+            series = value.get("series")
+            series = series if isinstance(series, list) else [series]
+            ordered_series = sorted(
+                (item for item in series if isinstance(item, dict)),
+                key=lambda item: int(
+                    "阅读" in str(item.get("name") or "")
+                    or "read" in str(item.get("name") or "").lower()
+                ),
+                reverse=True,
+            )
+            for series_item in ordered_series:
+                data = series_item.get("data")
+                if not isinstance(data, list) or not labels:
+                    continue
+                posts: list[dict[str, Any]] = []
+                for label, raw_reads in zip(labels, data):
+                    raw_value = raw_reads.get("value") if isinstance(raw_reads, dict) else raw_reads
+                    reads = _parse_metric_number(raw_value)
+                    published_at = _normalize_post_text(label, 64)
+                    if reads <= 0 or not published_at:
+                        continue
+                    fingerprint = f"{published_at}||{int(reads)}"
+                    posts.append(
+                        {
+                            "source_post_id": f"hash:{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:24]}",
+                            "published_at": published_at,
+                            "reads": int(round(reads)),
+                            "content": "",
+                            "cover_url": None,
+                            "post_url": None,
+                        }
+                    )
+                if posts:
+                    return posts[:max(1, min(limit, 50))]
+            for child in value.values():
+                posts = walk(child)
+                if posts:
+                    return posts
+        elif isinstance(value, list):
+            for child in value:
+                posts = walk(child)
+                if posts:
+                    return posts
+        return []
+
+    for option in options:
+        posts = walk(option)
+        if posts:
+            return posts
+    return []
 
 
 def _count_effective_metrics(extracted_data: dict[str, str], keys: list[str]) -> int:

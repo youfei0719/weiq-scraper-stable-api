@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if "playwright.sync_api" not in sys.modules:
     playwright_module = types.ModuleType("playwright")
     playwright_sync_api_module = types.ModuleType("playwright.sync_api")
+    playwright_async_api_module = types.ModuleType("playwright.async_api")
 
     class _PlaywrightTimeoutError(Exception):
         pass
@@ -24,11 +25,17 @@ if "playwright.sync_api" not in sys.modules:
     def _sync_playwright():  # noqa: ANN202
         raise RuntimeError("playwright is not installed in this test environment")
 
+    def _async_playwright():  # noqa: ANN202
+        raise RuntimeError("playwright is not installed in this test environment")
+
     playwright_sync_api_module.TimeoutError = _PlaywrightTimeoutError
     playwright_sync_api_module.sync_playwright = _sync_playwright
+    playwright_async_api_module.async_playwright = _async_playwright
     playwright_module.sync_api = playwright_sync_api_module
+    playwright_module.async_api = playwright_async_api_module
     sys.modules["playwright"] = playwright_module
     sys.modules["playwright.sync_api"] = playwright_sync_api_module
+    sys.modules["playwright.async_api"] = playwright_async_api_module
 
 import cloud_api
 

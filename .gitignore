@@ -15,6 +15,7 @@ weiq_results*.xlsx
 数据导出_*.xlsx
 latest.xlsx
 ~$*.xlsx
+.~*.xlsx
 *.db
 
 # Python 虚拟环境与缓存
