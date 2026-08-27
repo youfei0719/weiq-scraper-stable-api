@@ -20,6 +20,7 @@
 - README 启动说明改为与仓库真实入口一致，不再引用已不存在的 `desktop_app.py`。
 
 ### Fixed（修复）
+- 修复新浏览器会话首个账号的“最近20篇博文趋势”接口响应较慢时被过早标记为解析失败的问题；现在会在有限时间内等待已确认的 `getUserBlogList` 响应，并在同一账号存在多次响应时继续查找实际数据。
 - 修复双击启动器仍意外执行历史版 `scraper.py` 的入口漂移问题。现在 macOS、Windows 双击启动器均直接运行唯一的 `scraper_runtime.py`；同时保留 `python scraper.py` 兼容入口并转发至相同运行时，避免旧版“15 项核心指标 / 空白页”逻辑重新生效。
 - 修复 macOS 系统代理失效时，Playwright 浏览器继承代理导致 WEIQ 启动预检卡在 `about:blank` 或 `ERR_TIMED_OUT` 的问题；默认改为直连，仅在显式配置 `WEIQ_PROXY_SERVER` 时使用代理。
 - 修复无凭证首次启动时把 WEIQ 网络不可达误判为登录失效的问题，现在会区分 `NAVIGATION_ERROR` 与 `AUTH_REQUIRED`。

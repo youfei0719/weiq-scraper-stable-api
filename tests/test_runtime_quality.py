@@ -30,6 +30,7 @@ from scraper_runtime import (
     select_startup_state_file,
     to_atomic_excel,
     verify_homepage_login_state,
+    wait_for_post_trend_response,
 )
 
 
@@ -320,6 +321,29 @@ class RuntimeQualityTest(unittest.TestCase):
         self.assertEqual(empty_rows, [])
         self.assertEqual(empty_status, "empty")
         self.assertIsNotNone(empty_error)
+
+    def test_post_trend_parser_checks_later_response_after_empty_contract(self) -> None:
+        empty_payload = {"data": {"reads": {"list": []}}}
+        populated_payload = {
+            "data": {
+                "reads": {
+                    "list": [{"id": "post-1", "time": "2026-08-20", "value": 8, "text": "后续响应"}]
+                }
+            }
+        }
+        rows, status, error = extract_post_trend_rows(
+            [empty_payload, populated_payload],
+            uid="u",
+            account_id="a",
+            run_id="r",
+            crawl_time="now",
+        )
+        self.assertEqual((status, error), ("success", None))
+        self.assertEqual(rows[0]["source_post_id"], "post-1")
+
+    def test_post_trend_response_wait_returns_immediately_when_captured(self) -> None:
+        self.assertTrue(wait_for_post_trend_response([{"data": {}}], timeout_ms=8000))
+        self.assertFalse(wait_for_post_trend_response([], timeout_ms=0))
 
     def test_excel_output_contains_weekly_and_post_trend_sheets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

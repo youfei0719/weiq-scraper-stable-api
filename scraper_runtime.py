@@ -181,6 +181,7 @@ class CrawlConfig:
     wait_max_seconds: int = 4
     goto_timeout_ms: int = 45000
     network_idle_timeout_ms: int = 8000
+    post_trend_capture_timeout_ms: int = 8000
     retry_times: int = 1
     retry_backoff_seconds: int = 3
     resume: bool = True
@@ -1335,12 +1336,14 @@ def extract_post_trend_rows(
     crawl_time: str,
 ) -> tuple[list[dict[str, Any]], str, str | None]:
     """Parse the confirmed WEIQ getUserBlogList contract; no generic JSON scanning."""
+    saw_confirmed_contract = False
     for payload in payloads:
         data = payload.get("data") if isinstance(payload, dict) else None
         reads = data.get("reads") if isinstance(data, dict) else None
         items = reads.get("list") if isinstance(reads, dict) else None
         if not isinstance(items, list):
             continue
+        saw_confirmed_contract = True
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in items:
@@ -1360,8 +1363,26 @@ def extract_post_trend_rows(
                 break
         if rows:
             return rows, "success", None
+    if saw_confirmed_contract:
         return [], "empty", ERROR_MESSAGES_ZH[ErrorCode.POST_TREND_EMPTY]
     return [], "failed", ERROR_MESSAGES_ZH[ErrorCode.POST_TREND_PARSE]
+
+
+def wait_for_post_trend_response(
+    payloads: list[dict[str, Any]],
+    *,
+    timeout_ms: int,
+    poll_interval_ms: int = 200,
+) -> bool:
+    """Wait briefly for the tab's confirmed API response before parsing it."""
+    if payloads:
+        return True
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+    while time.monotonic() < deadline:
+        time.sleep(min(poll_interval_ms / 1000, max(deadline - time.monotonic(), 0)))
+        if payloads:
+            return True
+    return bool(payloads)
 
 
 def extract_post_trend_rows_from_echarts(
@@ -1523,6 +1544,12 @@ def process_account_url(
                     )
                 except Exception:
                     pass
+                # The overview numbers can render before getUserBlogList returns,
+                # especially for the first account in a fresh browser session.
+                wait_for_post_trend_response(
+                    trend_payloads,
+                    timeout_ms=config.post_trend_capture_timeout_ms,
+                )
             else:
                 print(f"\n{progress} 未定位到内容表现页签，将尝试读取已加载趋势数据...")
             perform_lazy_scroll(page)
